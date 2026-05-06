@@ -1,0 +1,16 @@
+[package]
+name = "renombrador"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27.2" # Interfaz gráfica (egui)
+reqwest = { version = "0.12.4", features = ["blocking", "json"] } # Peticiones HTTP
+serde = { version = "1.0", features = ["derive"] } # Guardar/Leer JSON
+serde_json = "1.0" # Trabajar con la respuesta de TMDb
+regex = "1.10.4" # Expresiones regulares
+rfd = "0.14.1" # Ventanas de diálogo nativas (para elegir carpeta)
+clipboard-win = "5.0" # Copiar al portapapeles
+
+[build-dependencies]
+winres = "0.1"
