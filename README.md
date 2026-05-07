@@ -1,4 +1,4 @@
-# Renombrador
+﻿# Renombrador
 
 **English** | [Español](#español)
 
@@ -106,4 +106,4 @@ El ejecutable queda en `target\release\renombrador.exe`.
 
 ## Licencia
 
-MIT © 2026 letzzar
+GNU General Public License v3.0 — ver [LICENSE](LICENSE)
