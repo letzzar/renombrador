@@ -3,3 +3,7 @@ target/
 Thumbs.db
 .vscode/
 .idea/
+
+# Intermediate artifacts for macOS icon generation (only build/icon.icns is tracked)
+build/icon.iconset/
+build/icon_full.png

@@ -2,6 +2,16 @@
 name = "renombrador"
 version = "0.1.0"
 edition = "2021"
+description = "Renombrador de series y películas usando TMDb"
+
+[package.metadata.bundle]
+name = "Renombrador"
+identifier = "com.letzzar.renombrador"
+icon = ["build/icon.icns"]
+category = "public.app-category.utilities"
+short_description = "Renombrador de series y películas"
+copyright = "Copyright (c) 2026 letzzar. GPL-3.0."
+osx_minimum_system_version = "11.0"
 
 [dependencies]
 eframe = "0.27.2" # Interfaz gráfica (egui)
