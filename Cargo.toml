@@ -10,7 +10,9 @@ serde = { version = "1.0", features = ["derive"] } # Guardar/Leer JSON
 serde_json = "1.0" # Trabajar con la respuesta de TMDb
 regex = "1.10.4" # Expresiones regulares
 rfd = "0.14.1" # Ventanas de diálogo nativas (para elegir carpeta)
-clipboard-win = "5.0" # Copiar al portapapeles
+arboard = "3" # Portapapeles multiplataforma (Windows, macOS, Linux)
+dirs = "5.0" # Carpetas estándar del sistema (AppData en Windows, Application Support en macOS)
+image = { version = "0.25", default-features = false, features = ["ico"] } # Decodificar el .ico para el icono de la ventana
 
-[build-dependencies]
-winres = "0.1"
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1" # Solo Windows: embebe el icono en el .exe

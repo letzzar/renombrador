@@ -11,11 +11,24 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
     thread,
 };
-use clipboard_win::{formats, set_clipboard};
+use arboard::Clipboard;
 
 const BASE_URL: &str = "https://api.themoviedb.org/3";
 const ARCHIVO_CONFIG: &str = "config.json";
+const NOMBRE_APP: &str = "renombrador";
 const EXTENSIONES_VALIDAS: [&str; 3] = ["mkv", "mp4", "avi"];
+
+// Resuelve la ruta del config en la carpeta estándar del usuario:
+//   Windows: %APPDATA%\renombrador\config.json
+//   macOS:   ~/Library/Application Support/renombrador/config.json
+//   Linux:   ~/.config/renombrador/config.json
+// Fallback: si el SO no devuelve config_dir, usa el directorio de trabajo.
+fn ruta_config() -> PathBuf {
+    match dirs::config_dir() {
+        Some(base) => base.join(NOMBRE_APP).join(ARCHIVO_CONFIG),
+        None => PathBuf::from(ARCHIVO_CONFIG),
+    }
+}
 
 // Estructura para guardar la configuración
 #[derive(Serialize, Deserialize, Default)]
@@ -128,7 +141,24 @@ impl Default for AppRenombrador {
 
 impl AppRenombrador {
     fn cargar_config(&mut self) {
-        if let Ok(contenido) = fs::read_to_string(ARCHIVO_CONFIG) {
+        let ruta = ruta_config();
+
+        // Migración suave: si no existe en la carpeta estándar pero sí en el
+        // directorio de trabajo (instalaciones antiguas), trasladarlo.
+        let legacy = PathBuf::from(ARCHIVO_CONFIG);
+        if !ruta.exists() && legacy.exists() {
+            if let Some(padre) = ruta.parent() {
+                let _ = fs::create_dir_all(padre);
+            }
+            if fs::rename(&legacy, &ruta).is_err() {
+                // Si el rename falla (p. ej. distinto volumen), copiar + borrar.
+                if fs::copy(&legacy, &ruta).is_ok() {
+                    let _ = fs::remove_file(&legacy);
+                }
+            }
+        }
+
+        if let Ok(contenido) = fs::read_to_string(&ruta) {
             if let Ok(config) = serde_json::from_str::<Config>(&contenido) {
                 self.api_key = config.api_key;
                 self.directorio = config.directorio;
@@ -137,12 +167,23 @@ impl AppRenombrador {
     }
 
     fn guardar_config(&self) {
+        let ruta = ruta_config();
+        if let Some(padre) = ruta.parent() {
+            if let Err(e) = fs::create_dir_all(padre) {
+                let _ = self.log_tx.send(format!(
+                    "Aviso: no se pudo crear la carpeta de configuración ({}): {}",
+                    padre.display(),
+                    e
+                ));
+                return;
+            }
+        }
         let config = Config {
             api_key: self.api_key.clone(),
             directorio: self.directorio.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&config) {
-            let _ = fs::write(ARCHIVO_CONFIG, json);
+            let _ = fs::write(&ruta, json);
         }
     }
 
@@ -176,20 +217,26 @@ impl AppRenombrador {
                             let _ = tx.send(format!("Procesando: {}", nombre_archivo));
                             ctx.request_repaint();
 
-                            if modo_series {
-                                // Lógica para series
-                                let (titulo_busqueda, episodio_info) = extraer_info_archivo(&nombre_archivo);
+                            let (titulo_busqueda, episodio_info) = extraer_info_archivo(&nombre_archivo);
+
+                            // Auto-detección: si el nombre contiene marcadores de episodio (SxxEyy o NxM),
+                            // tratar el archivo como serie aunque el modo seleccionado sea "Películas".
+                            // Sin esto, en carpetas mixtas todos los episodios de una misma serie generaban
+                            // el mismo nombre destino y `fs::rename` los sobreescribía entre sí (data loss).
+                            let tratar_como_serie = modo_series || episodio_info.is_some();
+
+                            if tratar_como_serie {
                                 if let Some(ep) = episodio_info {
                                     let resultado = buscar_serie_en_tmdb(&client, &titulo_busqueda, &api_key, ep.temporada, ep.episodio, idioma_titulo);
-                                    
+
                                     if let Some(info) = resultado {
+                                        let ep_ref = info.episodio.as_ref().unwrap();
                                         let formato_ep = if formato_episodio {
-                                            format!("{}x{:02}", info.episodio.as_ref().unwrap().temporada, info.episodio.as_ref().unwrap().episodio)
+                                            format!("{}x{:02}", ep_ref.temporada, ep_ref.episodio)
                                         } else {
-                                            format!("S{:02}E{:02}", info.episodio.as_ref().unwrap().temporada, info.episodio.as_ref().unwrap().episodio)
+                                            format!("S{:02}E{:02}", ep_ref.temporada, ep_ref.episodio)
                                         };
-                                        
-                                        // Limpiar nombre de serie y episodio de caracteres inválidos
+
                                         let titulo_limpio = limpiar_nombre_archivo(&info.titulo);
                                         let nuevo_nombre = if let Some(ep_name) = &info.nombre_episodio {
                                             let ep_name_limpio = limpiar_nombre_archivo(ep_name);
@@ -203,7 +250,7 @@ impl AppRenombrador {
                                         if path.file_name().unwrap() == nuevo_nombre.as_str() {
                                             let _ = tx.send("  -> Ya tiene el formato correcto. Omitiendo.".to_string());
                                         } else {
-                                            match fs::rename(&path, &nueva_ruta) {
+                                            match renombrar_si_seguro(&path, &nueva_ruta) {
                                                 Ok(_) => { let _ = tx.send(format!("  -> Renombrado a: {}", nuevo_nombre)); },
                                                 Err(e) => { let _ = tx.send(format!("  -> Error al renombrar: {}", e)); },
                                             }
@@ -215,9 +262,7 @@ impl AppRenombrador {
                                     let _ = tx.send("  -> No se detectó episodio en el nombre del archivo.".to_string());
                                 }
                             } else {
-                                // Lógica para películas (original)
-                                let (titulo_busqueda, episodio_info) = extraer_info_archivo(&nombre_archivo);
-                                let resultado = buscar_en_tmdb(&client, &titulo_busqueda, &api_key, episodio_info.clone(), idioma_titulo);
+                                let resultado = buscar_en_tmdb(&client, &titulo_busqueda, &api_key, None, idioma_titulo);
 
                                 if let Some(info) = resultado {
                                     let titulo_limpio = limpiar_nombre_archivo(&info.titulo);
@@ -228,7 +273,7 @@ impl AppRenombrador {
                                     if path.file_name().unwrap() == nuevo_nombre.as_str() {
                                         let _ = tx.send("  -> Ya tiene el formato correcto. Omitiendo.".to_string());
                                     } else {
-                                        match fs::rename(&path, &nueva_ruta) {
+                                        match renombrar_si_seguro(&path, &nueva_ruta) {
                                             Ok(_) => { let _ = tx.send(format!("  -> Renombrado a: {}", nuevo_nombre)); },
                                             Err(e) => { let _ = tx.send(format!("  -> Error al renombrar: {}", e)); },
                                         }
@@ -332,7 +377,9 @@ impl eframe::App for AppRenombrador {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Registro de actividad:").strong());
                 if ui.button("📋 Copiar todo").clicked() {
-                    let _ = set_clipboard(formats::Unicode, &self.logs);
+                    if let Ok(mut cb) = Clipboard::new() {
+                        let _ = cb.set_text(self.logs.clone());
+                    }
                 }
             });
             
@@ -465,6 +512,31 @@ fn limpiar_titulo_serie(titulo: &str) -> String {
     limpio.trim().to_string()
 }
 
+// Renombra `origen` a `destino` sin sobreescribir un archivo distinto preexistente.
+// En Windows `std::fs::rename` usa MOVEFILE_REPLACE_EXISTING y borra el destino;
+// este guard evita que dos archivos con el mismo nombre destino (p. ej. episodios
+// procesados como película) se aniquilen entre sí.
+fn renombrar_si_seguro(origen: &Path, destino: &Path) -> Result<(), String> {
+    if destino.exists() {
+        let mismo_archivo = fs::canonicalize(origen)
+            .ok()
+            .zip(fs::canonicalize(destino).ok())
+            .map(|(o, d)| o == d)
+            .unwrap_or(false);
+        if !mismo_archivo {
+            let nombre_dest = destino
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            return Err(format!(
+                "el destino '{}' ya existe; se omite para no sobreescribirlo",
+                nombre_dest
+            ));
+        }
+    }
+    fs::rename(origen, destino).map_err(|e| e.to_string())
+}
+
 fn limpiar_nombre_archivo(nombre: &str) -> String {
     let re_invalidos = Regex::new(r#"[<>:\"/|?*]"#).unwrap();
     let limpio = re_invalidos.replace_all(nombre, "");
@@ -537,11 +609,30 @@ fn buscar_serie_en_tmdb(client: &Client, titulo: &str, api_key: &str, temporada:
     None
 }
 
+// Decodifica el .ico embebido a píxeles RGBA para que egui lo use como icono
+// de la ventana (esquina superior + barra de tareas en algunos compositores).
+// El icono del propio .exe ya lo embebe build.rs vía winres; esto es lo otro.
+fn cargar_icono_ventana() -> Option<egui::IconData> {
+    const ICONO_BYTES: &[u8] = include_bytes!("../logo_app.ico");
+    let imagen = image::load_from_memory_with_format(ICONO_BYTES, image::ImageFormat::Ico).ok()?;
+    let rgba = imagen.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([600.0, 500.0])
+        .with_title("Renombrador TMDb");
+    if let Some(icono) = cargar_icono_ventana() {
+        viewport = viewport.with_icon(icono);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 500.0])
-            .with_title("Renombrador TMDb"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
