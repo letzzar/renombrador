@@ -23,6 +23,7 @@ rfd = "0.14.1" # Ventanas de diálogo nativas (para elegir carpeta)
 arboard = "3" # Portapapeles multiplataforma (Windows, macOS, Linux)
 dirs = "5.0" # Carpetas estándar del sistema (AppData en Windows, Application Support en macOS)
 image = { version = "0.25", default-features = false, features = ["ico"] } # Decodificar el .ico para el icono de la ventana
+strsim = "0.11" # Jaro-Winkler para puntuar similitud de títulos
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1" # Solo Windows: embebe el icono en el .exe
