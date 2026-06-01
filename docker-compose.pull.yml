@@ -16,8 +16,8 @@
 
 services:
   renombrador:
-    # GHCR (público, sin login). Alternativa Docker Hub: letzzar/renombrador:latest
-    image: ghcr.io/letzzar/renombrador:latest
+    # Docker Hub (público). Alternativa GHCR: ghcr.io/letzzar/renombrador:latest
+    image: letzzar/renombrador:latest
     container_name: renombrador-tmdb
     restart: unless-stopped
     pull_policy: always
