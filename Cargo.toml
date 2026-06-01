@@ -2,7 +2,10 @@
 name = "renombrador"
 version = "0.1.0"
 edition = "2021"
-description = "Renombrador de series y películas usando TMDb"
+description = "Renombrador de series y películas usando TMDb (app de escritorio + servicio Docker)"
+# Desactivamos el autodescubrimiento de binarios para declararlos explícitamente
+# y poder marcar la GUI como opcional (solo se compila con la feature `gui`).
+autobins = false
 
 [package.metadata.bundle]
 name = "Renombrador"
@@ -13,17 +16,44 @@ short_description = "Renombrador de series y películas"
 copyright = "Copyright (c) 2026 letzzar. GPL-3.0."
 osx_minimum_system_version = "11.0"
 
+# Lógica pura compartida (parseo de nombres, llamadas a TMDb, movimiento de
+# archivos, caché). La usan tanto el servicio como la GUI.
+[lib]
+name = "renombrador"
+path = "src/lib.rs"
+
+# Servicio headless para Linux/Docker. Es el binario por defecto.
+[[bin]]
+name = "renombrador-daemon"
+path = "src/main.rs"
+
+# App de escritorio original (egui). Solo se compila si se activa la feature
+# `gui`, para que el build del servicio en Docker no arrastre dependencias
+# gráficas pesadas (eframe, etc.).
+[[bin]]
+name = "renombrador-gui"
+path = "src/bin/renombrador-gui.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+gui = ["dep:eframe", "dep:arboard", "dep:rfd", "dep:image", "dep:dirs"]
+
 [dependencies]
-eframe = "0.27.2" # Interfaz gráfica (egui)
-reqwest = { version = "0.12.4", features = ["blocking", "json"] } # Peticiones HTTP
-serde = { version = "1.0", features = ["derive"] } # Guardar/Leer JSON
-serde_json = "1.0" # Trabajar con la respuesta de TMDb
-regex = "1.10.4" # Expresiones regulares
-rfd = "0.14.1" # Ventanas de diálogo nativas (para elegir carpeta)
-arboard = "3" # Portapapeles multiplataforma (Windows, macOS, Linux)
-dirs = "5.0" # Carpetas estándar del sistema (AppData en Windows, Application Support en macOS)
-image = { version = "0.25", default-features = false, features = ["ico"] } # Decodificar el .ico para el icono de la ventana
-strsim = "0.11" # Jaro-Winkler para puntuar similitud de títulos
+# --- Núcleo compartido (servicio + GUI) ---
+reqwest = { version = "0.12.4", default-features = false, features = ["blocking", "json", "rustls-tls"] } # Peticiones HTTPS a TMDb (TLS puro en Rust, sin OpenSSL del sistema)
+serde = { version = "1.0", features = ["derive"] }                 # Serializar config/caché
+serde_json = "1.0"                                                 # Respuestas de TMDb y caché
+regex = "1.10.4"                                                   # Parseo de nombres de archivo
+strsim = "0.11"                                                    # Jaro-Winkler para puntuar similitud
+walkdir = "2"                                                      # Recorrido recursivo de la carpeta de descargas
+
+# --- Solo GUI (opcionales, feature `gui`) ---
+eframe = { version = "0.27.2", optional = true }                                              # Interfaz gráfica (egui)
+arboard = { version = "3", optional = true }                                                  # Portapapeles
+rfd = { version = "0.14.1", optional = true }                                                 # Diálogo de carpeta
+image = { version = "0.25", default-features = false, features = ["ico"], optional = true }   # Icono de ventana
+dirs = { version = "5.0", optional = true }                                                   # Carpeta de config del SO
 
 [target.'cfg(windows)'.build-dependencies]
-winres = "0.1" # Solo Windows: embebe el icono en el .exe
+winres = "0.1" # Solo Windows (GUI): embebe el icono en el .exe

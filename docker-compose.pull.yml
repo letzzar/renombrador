@@ -1,0 +1,33 @@
+# Variante que USA la imagen ya publicada (NO compila nada).
+# Úsala una vez que GitHub Actions haya publicado la imagen.
+#
+# Arranque:  docker compose -f docker-compose.pull.yml up -d
+#
+# Cambia `image:` por tu imagen:
+#   - Docker Hub:  TUUSUARIO/renombrador:latest
+#   - GHCR:        ghcr.io/letzzar/renombrador:latest
+#
+# ---
+# Variant that USES the published image (does NOT build anything).
+# Use it once GitHub Actions has published the image.
+#   Start:  docker compose -f docker-compose.pull.yml up -d
+# Change `image:` to yours (Docker Hub: YOURUSER/renombrador:latest, or
+# GHCR: ghcr.io/letzzar/renombrador:latest).
+
+services:
+  renombrador:
+    image: letzzar/renombrador:latest
+    container_name: renombrador-tmdb
+    restart: unless-stopped
+    pull_policy: always
+
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Madrid}
+
+    volumes:
+      - ${DOWNLOADS_DIR:-./datos/descargas}:/descargas
+      - ${MOVIES_HOST_DIR:-./datos/peliculas}:/peliculas
+      - ${SERIES_HOST_DIR:-./datos/series}:/series
+      - ${CONFIG_DIR:-./datos/config}:/config

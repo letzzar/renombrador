@@ -3,6 +3,13 @@
 Notas para la próxima sesión de Claude en el Mac. El usuario quiere
 que yo (Claude) haga la compilación allí.
 
+> **⚠️ Actualización (servicio Docker):** el proyecto ahora compila dos binarios.
+> La **GUI** está detrás de la feature `gui` y se llama `renombrador-gui`. Para el
+> Mac usa **`cargo build --release --features gui --bin renombrador-gui`** y el
+> binario queda en `target/release/renombrador-gui`. Lo mismo para `cargo bundle`:
+> `cargo bundle --release --features gui --bin renombrador-gui`. El otro binario,
+> `renombrador-daemon`, es el servicio Linux y no aplica al empaquetado de macOS.
+
 ## Estado actual
 
 Commit relevante: `19603eb` — *Fix episode collision, portable config and clipboard, window icon*.

@@ -6,6 +6,10 @@
 
 A native Windows desktop app built in Rust (egui) that renames movie and TV show video files using the [TMDb](https://www.themoviedb.org/) API, with multi-language title support.
 
+> **🐳 Running on Linux / a NAS?** There is now a headless **Docker service** that
+> watches your downloads folder and automatically renames + moves new videos into
+> your movies/series libraries (Plex/Jellyfin layout). See **[DOCKER.md](DOCKER.md)**.
+
 ## Features
 
 - Scans a folder for video files (`.mkv`, `.mp4`, `.avi`)
@@ -37,16 +41,21 @@ A native Windows desktop app built in Rust (egui) that renames movie and TV show
 git clone https://github.com/letzzar/renombrador.git
 cd renombrador
 
-cargo build --release
+# Desktop GUI app (requires the `gui` feature):
+cargo build --release --features gui --bin renombrador-gui
 ```
 
-The executable is placed in `target\release\renombrador.exe`.
+The executable is placed in `target\release\renombrador-gui.exe`.
 
 > **Tip:** On first build, Cargo downloads and compiles all dependencies (~2–5 min). Subsequent builds are much faster.
 
+> **Note:** The repository also builds a headless `renombrador-daemon` binary (the
+> Docker service) with plain `cargo build --release`. The GUI lives behind the
+> `gui` feature so the service build stays lean. See [DOCKER.md](DOCKER.md).
+
 ## Usage
 
-1. Launch `renombrador.exe`
+1. Launch `renombrador-gui.exe`
 2. Enter your TMDb API key on first launch (saved automatically to `config.json`)
 3. Click **Select folder** and choose the directory with your video files
 4. Select the desired language for titles
@@ -57,6 +66,11 @@ The executable is placed in `target\release\renombrador.exe`.
 ## Español
 
 App de escritorio nativa para Windows construida en Rust (egui) que renombra archivos de películas y series usando la API de [TMDb](https://www.themoviedb.org/), con soporte multiidioma.
+
+> **🐳 ¿Lo quieres en Linux / un NAS?** Ahora hay un **servicio Docker** sin
+> interfaz que vigila tu carpeta de descargas y renombra + mueve automáticamente
+> los vídeos nuevos a tus carpetas de películas/series (estructura Plex/Jellyfin).
+> Consulta **[DOCKER.md](DOCKER.md)**.
 
 ## Características
 
@@ -89,16 +103,21 @@ App de escritorio nativa para Windows construida en Rust (egui) que renombra arc
 git clone https://github.com/letzzar/renombrador.git
 cd renombrador
 
-cargo build --release
+# App de escritorio (requiere la feature `gui`):
+cargo build --release --features gui --bin renombrador-gui
 ```
 
-El ejecutable queda en `target\release\renombrador.exe`.
+El ejecutable queda en `target\release\renombrador-gui.exe`.
 
 > **Consejo:** En la primera compilación, Cargo descarga y compila todas las dependencias (~2–5 min). Las siguientes compilaciones son mucho más rápidas.
 
+> **Nota:** El repositorio también compila el binario `renombrador-daemon` (el
+> servicio Docker) con un simple `cargo build --release`. La GUI está detrás de la
+> feature `gui` para que el build del servicio sea ligero. Ver [DOCKER.md](DOCKER.md).
+
 ## Uso
 
-1. Lanza `renombrador.exe`
+1. Lanza `renombrador-gui.exe`
 2. Introduce tu clave API de TMDb en el primer arranque (se guarda automáticamente en `config.json`)
 3. Haz clic en **Seleccionar carpeta** y elige el directorio con tus archivos de vídeo
 4. Selecciona el idioma deseado para los títulos

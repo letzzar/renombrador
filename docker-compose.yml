@@ -1,0 +1,26 @@
+# Servicio que vigila la carpeta de descargas, renombra los vídeos nuevos con
+# los datos de TMDb y los mueve a las carpetas de películas/series.
+#
+# Antes de arrancar:  cp .env.example .env  y edita .env (al menos TMDB_API_KEY
+# y las rutas del host).  Luego:  docker compose up -d --build
+
+services:
+  renombrador:
+    build: .
+    image: renombrador-tmdb:latest
+    container_name: renombrador-tmdb
+    restart: unless-stopped
+
+    # Todas las variables del servicio se leen de .env (ver .env.example).
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Madrid}
+
+    volumes:
+      # IZQUIERDA = carpeta de tu host  ·  DERECHA = ruta dentro del contenedor.
+      # Edita las rutas del host en .env (o sustitúyelas aquí directamente).
+      - ${DOWNLOADS_DIR:-./datos/descargas}:/descargas
+      - ${MOVIES_HOST_DIR:-./datos/peliculas}:/peliculas
+      - ${SERIES_HOST_DIR:-./datos/series}:/series
+      - ${CONFIG_DIR:-./datos/config}:/config

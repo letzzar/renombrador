@@ -1,0 +1,21 @@
+# Artefactos de compilación (se recompila dentro del contenedor)
+target/
+
+# Control de versiones y datos locales
+.git/
+.gitignore
+datos/
+.env
+
+# Recursos de la GUI que no necesita el servicio
+build/
+logo_app.ico
+*.icns
+
+# Documentación e IDE
+*.md
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db

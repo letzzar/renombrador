@@ -4,6 +4,16 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Servicio Docker: configuración local y datos montados
+.env
+datos/
+
+# Carpeta de despliegue local para Synology (contiene la API key; NO subir)
+synology/
+
+# Configuración local de Claude Code (puede contener rutas/credenciales locales)
+.claude/
+
 # Intermediate artifacts for macOS icon generation (only build/icon.icns is tracked)
 build/icon.iconset/
 build/icon_full.png
