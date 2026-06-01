@@ -15,6 +15,11 @@ on:
     tags: [ 'v*' ]
   workflow_dispatch:
 
+# Cancela una ejecución anterior si llega un push nuevo a la misma rama.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-push:
     runs-on: ubuntu-latest
@@ -70,13 +75,14 @@ jobs:
             type=ref,event=tag
             type=sha,format=short
 
-      # Nota: arm64 se construye por emulación (QEMU) y es lento porque compila
-      # Rust. Si tu NAS es Intel/AMD, puedes dejar solo linux/amd64 para acelerar.
+      # Solo amd64 (lo habitual en Synology x86 y la mayoría de servidores).
+      # Si necesitas ARM, añade ",linux/arm64" — pero compila Rust por emulación
+      # (QEMU) y tarda bastante más.
       - name: Construir y publicar
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
