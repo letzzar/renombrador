@@ -147,7 +147,8 @@ fn enmascarar(api_key: &str) -> String {
     if n <= 4 {
         "****".to_string()
     } else {
-        format!("****{}", &api_key[api_key.len().saturating_sub(4)..])
+        let ultimos: String = api_key.chars().skip(n - 4).collect();
+        format!("****{}", ultimos)
     }
 }
 
@@ -310,6 +311,9 @@ fn bucle(env: &Entorno, client: &Client, cache: &mut SeriesCache) {
             }
 
             let size = meta.len();
+            if size < env.min_bytes {
+                continue; // probablemente un sample u otro archivo pequeño
+            }
 
             // Si cambió de tamaño desde el último sondeo, le damos otra
             // oportunidad (sale de la lista de "sin acción").
@@ -322,9 +326,6 @@ fn bucle(env: &Entorno, client: &Client, cache: &mut SeriesCache) {
                 && edad_archivo(&meta) >= env.estable;
             tamano_previo.insert(path.clone(), size);
 
-            if size < env.min_bytes {
-                continue; // probablemente un sample u otro archivo pequeño
-            }
             if !estable_ahora || sin_accion.contains(&path) {
                 continue;
             }

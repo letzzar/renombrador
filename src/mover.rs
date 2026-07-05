@@ -59,10 +59,24 @@ pub fn mover_seguro(origen: &Path, destino: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    fs::copy(origen, destino).map_err(|e| {
+    // Copiamos a un temporal `.part` junto al destino y renombramos al final:
+    // si el proceso muere a mitad de copia nunca queda un destino parcial que
+    // parezca un vídeo válido (y que bloquearía reintentos por "ya existe").
+    let mut nombre_tmp = destino
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    nombre_tmp.push(".part");
+    let tmp = destino.with_file_name(nombre_tmp);
+
+    fs::copy(origen, &tmp).map_err(|e| {
         // Si la copia falló a medias, intentamos no dejar basura.
-        let _ = fs::remove_file(destino);
-        format!("error al copiar a '{}': {}", destino.display(), e)
+        let _ = fs::remove_file(&tmp);
+        format!("error al copiar a '{}': {}", tmp.display(), e)
+    })?;
+    fs::rename(&tmp, destino).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("error al renombrar '{}' a su nombre final: {}", tmp.display(), e)
     })?;
     fs::remove_file(origen)
         .map_err(|e| format!("copiado correctamente pero no se pudo borrar el origen: {}", e))?;

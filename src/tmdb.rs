@@ -23,109 +23,30 @@ pub struct Candidato {
     pub score: f64, // similitud calculada contra la query original
 }
 
-pub fn buscar_candidatos_serie(
-    client: &Client,
-    titulo: &str,
-    api_key: &str,
-    idioma: Idioma,
-) -> Vec<Candidato> {
-    let url = format!("{}/search/tv", BASE_URL);
-    let variantes = variantes_busqueda(titulo, idioma);
-    let mut todos: Vec<Candidato> = Vec::new();
-    let mut ids_vistos: std::collections::HashSet<i64> = std::collections::HashSet::new();
-
-    for (query, lang) in &variantes {
-        let resp = client
-            .get(&url)
-            .query(&[
-                ("api_key", api_key),
-                ("query", query),
-                ("language", lang.codigo()),
-            ])
-            .send();
-        if let Ok(r) = resp {
-            if let Ok(datos) = r.json::<Value>() {
-                if let Some(resultados) = datos.get("results").and_then(|r| r.as_array()) {
-                    for item in resultados.iter().take(10) {
-                        let id = match item.get("id").and_then(|i| i.as_i64()) {
-                            Some(i) => i,
-                            None => continue,
-                        };
-                        if ids_vistos.contains(&id) {
-                            continue;
-                        }
-                        ids_vistos.insert(id);
-                        let titulo = item
-                            .get("name")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let original = item
-                            .get("original_name")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let fecha = item
-                            .get("first_air_date")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("");
-                        let anio = if fecha.len() >= 4 {
-                            fecha[..4].to_string()
-                        } else {
-                            "0000".to_string()
-                        };
-                        let popularidad =
-                            item.get("popularity").and_then(|p| p.as_f64()).unwrap_or(0.0);
-                        let overview: String = item
-                            .get("overview")
-                            .and_then(|o| o.as_str())
-                            .unwrap_or("")
-                            .chars()
-                            .take(180)
-                            .collect();
-                        todos.push(Candidato {
-                            id,
-                            media_type: "tv".to_string(),
-                            titulo,
-                            nombre_original: original,
-                            anio,
-                            popularidad,
-                            overview,
-                            score: 0.0,
-                        });
-                    }
-                }
-            }
-        }
-        if todos.len() >= MAX_CANDIDATOS * 2 {
-            break;
-        }
+/// Año ("0000" si falta) a partir de una fecha ISO `YYYY-MM-DD` de TMDb.
+fn anio_de_fecha(fecha: &str) -> String {
+    if fecha.len() >= 4 {
+        fecha[..4].to_string()
+    } else {
+        "0000".to_string()
     }
-
-    for c in todos.iter_mut() {
-        c.score = similitud(titulo, &c.titulo, &c.nombre_original);
-    }
-    todos.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.popularidad
-                    .partial_cmp(&a.popularidad)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
-    todos.truncate(MAX_CANDIDATOS);
-    todos
 }
 
-pub fn buscar_candidatos_pelicula(
+/// Búsqueda multi-variante común a series y películas. Los endpoints
+/// `search/tv` y `search/movie` solo difieren en el nombre de los campos.
+fn buscar_candidatos(
     client: &Client,
     titulo: &str,
     api_key: &str,
     idioma: Idioma,
+    media_type: &str, // "tv" o "movie"
 ) -> Vec<Candidato> {
-    let url = format!("{}/search/movie", BASE_URL);
+    let (endpoint, campo_titulo, campo_original, campo_fecha) = if media_type == "tv" {
+        ("search/tv", "name", "original_name", "first_air_date")
+    } else {
+        ("search/movie", "title", "original_title", "release_date")
+    };
+    let url = format!("{}/{}", BASE_URL, endpoint);
     let variantes = variantes_busqueda(titulo, idioma);
     let mut todos: Vec<Candidato> = Vec::new();
     let mut ids_vistos: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -147,29 +68,22 @@ pub fn buscar_candidatos_pelicula(
                             Some(i) => i,
                             None => continue,
                         };
-                        if ids_vistos.contains(&id) {
+                        if !ids_vistos.insert(id) {
                             continue;
                         }
-                        ids_vistos.insert(id);
                         let titulo_c = item
-                            .get("title")
+                            .get(campo_titulo)
                             .and_then(|t| t.as_str())
                             .unwrap_or("")
                             .to_string();
                         let original = item
-                            .get("original_title")
+                            .get(campo_original)
                             .and_then(|t| t.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let fecha = item
-                            .get("release_date")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("");
-                        let anio = if fecha.len() >= 4 {
-                            fecha[..4].to_string()
-                        } else {
-                            "0000".to_string()
-                        };
+                        let anio = anio_de_fecha(
+                            item.get(campo_fecha).and_then(|d| d.as_str()).unwrap_or(""),
+                        );
                         let popularidad =
                             item.get("popularity").and_then(|p| p.as_f64()).unwrap_or(0.0);
                         let overview: String = item
@@ -181,7 +95,7 @@ pub fn buscar_candidatos_pelicula(
                             .collect();
                         todos.push(Candidato {
                             id,
-                            media_type: "movie".to_string(),
+                            media_type: media_type.to_string(),
                             titulo: titulo_c,
                             nombre_original: original,
                             anio,
@@ -215,6 +129,24 @@ pub fn buscar_candidatos_pelicula(
     todos
 }
 
+pub fn buscar_candidatos_serie(
+    client: &Client,
+    titulo: &str,
+    api_key: &str,
+    idioma: Idioma,
+) -> Vec<Candidato> {
+    buscar_candidatos(client, titulo, api_key, idioma, "tv")
+}
+
+pub fn buscar_candidatos_pelicula(
+    client: &Client,
+    titulo: &str,
+    api_key: &str,
+    idioma: Idioma,
+) -> Vec<Candidato> {
+    buscar_candidatos(client, titulo, api_key, idioma, "movie")
+}
+
 /// Devuelve (nombre, año) de una serie a partir de su id.
 pub fn buscar_nombre_serie(
     client: &Client,
@@ -230,15 +162,12 @@ pub fn buscar_nombre_serie(
         .ok()?;
     let datos: Value = resp.json().ok()?;
     let nombre = datos.get("name").and_then(|n| n.as_str())?.to_string();
-    let fecha = datos
-        .get("first_air_date")
-        .and_then(|d| d.as_str())
-        .unwrap_or("");
-    let anio = if fecha.len() >= 4 {
-        fecha[..4].to_string()
-    } else {
-        "0000".to_string()
-    };
+    let anio = anio_de_fecha(
+        datos
+            .get("first_air_date")
+            .and_then(|d| d.as_str())
+            .unwrap_or(""),
+    );
     Some((nombre, anio))
 }
 

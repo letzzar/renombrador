@@ -5,7 +5,17 @@
 use crate::config::Idioma;
 use regex::Regex;
 use std::path::Path;
+use std::sync::OnceLock;
 use strsim::jaro_winkler;
+
+/// Compila un regex una sola vez por proceso (los patrones son constantes y
+/// `Regex::new` es costoso; antes se recompilaban con cada archivo).
+macro_rules! regex_estatico {
+    ($pat:expr) => {{
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new($pat).unwrap())
+    }};
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct EpisodioInfo {
@@ -29,11 +39,11 @@ pub fn extraer_info_archivo(nombre_archivo: &str) -> (String, Option<EpisodioInf
         .to_string();
 
     // Quitar segmentos entre corchetes/llaves: [YTS.MX], {eztv}, [www.web.com]…
-    let re_corchetes = Regex::new(r"[\[\{][^\]\}]*[\]\}]").unwrap();
+    let re_corchetes = regex_estatico!(r"[\[\{][^\]\}]*[\]\}]");
     let sin_corchetes = re_corchetes.replace_all(&nombre_sin_ext, " ").to_string();
 
-    let re_episodio_simple = Regex::new(r"\b(\d+)x(\d+)\b").unwrap();
-    let re_episodio_formato = Regex::new(r"[Ss](\d+)[Ee](\d+)").unwrap();
+    let re_episodio_simple = regex_estatico!(r"\b(\d+)x(\d+)\b");
+    let re_episodio_formato = regex_estatico!(r"[Ss](\d+)[Ee](\d+)");
 
     // Detección de episodio con guardia: descartamos temporadas absurdas
     // (p. ej. una resolución "1920x1080" no es la temporada 1920).
@@ -59,14 +69,14 @@ pub fn extraer_info_archivo(nombre_archivo: &str) -> (String, Option<EpisodioInf
     // El año es útil para diferenciar remakes ("Dune (1984)" vs "Dune (2021)")
     // y series ("Doctor Who (2005)"), así que NO lo eliminamos; las etiquetas
     // de release que pudieran ir después se recortan luego.
-    let re_año = Regex::new(r"\(\s*([12]\d{3})\s*\)").unwrap();
+    let re_año = regex_estatico!(r"\(\s*([12]\d{3})\s*\)");
     let titulo_sin_metadata = re_año.replace_all(titulo_antes_episodio, " $1 ");
 
     // Capa 1: limpieza no destructiva. Sustituimos solo separadores típicos
     // de nombres de release (puntos, guiones bajos, guiones) por espacios y
     // colapsamos. Conservamos diacríticos y apóstrofes para no romper títulos
     // como "La maldición de Widow's Bay".
-    let re_sep = Regex::new(r"[\._\-]+").unwrap();
+    let re_sep = regex_estatico!(r"[\._\-]+");
     let titulo_espaciado = re_sep.replace_all(titulo_sin_metadata.as_ref(), " ");
 
     // Capa 1b: recortar el título en cuanto aparece una etiqueta de release.
@@ -74,11 +84,11 @@ pub fn extraer_info_archivo(nombre_archivo: &str) -> (String, Option<EpisodioInf
     let titulo_recortado = recortar_en_tag_release(&titulo_espaciado);
 
     // Quitar caracteres prohibidos en nombres de archivo (y barras varias).
-    let re_invalidos = Regex::new(r#"[<>:"/\\|?*]"#).unwrap();
+    let re_invalidos = regex_estatico!(r#"[<>:"/\\|?*]"#);
     let limpio = re_invalidos.replace_all(&titulo_recortado, " ");
 
     // Colapsar espacios.
-    let re_espacios = Regex::new(r"\s+").unwrap();
+    let re_espacios = regex_estatico!(r"\s+");
     let limpio = re_espacios.replace_all(&limpio, " ").trim().to_string();
 
     (limpio, episodio_info)
@@ -275,10 +285,10 @@ pub fn clave_cache(titulo: &str) -> String {
 
 /// Quita caracteres inválidos para nombres de archivo y colapsa espacios.
 pub fn limpiar_nombre_archivo(nombre: &str) -> String {
-    let re_invalidos = Regex::new(r#"[<>:"/\\|?*]"#).unwrap();
+    let re_invalidos = regex_estatico!(r#"[<>:"/\\|?*]"#);
     let limpio = re_invalidos.replace_all(nombre, "");
 
-    let re_espacios = Regex::new(" +").unwrap();
+    let re_espacios = regex_estatico!(" +");
     let limpio = re_espacios.replace_all(&limpio, " ");
 
     limpio.trim().to_string()
