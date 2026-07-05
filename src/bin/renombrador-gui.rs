@@ -279,8 +279,22 @@ impl AppRenombrador {
                     }
 
                     // Capa 2: búsqueda progresiva multi-query.
-                    let candidatos =
-                        buscar_candidatos_serie(&client, &titulo_extraido, &api_key, idioma_titulo);
+                    let candidatos = match buscar_candidatos_serie(
+                        &client,
+                        &titulo_extraido,
+                        &api_key,
+                        idioma_titulo,
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(MensajeUI::Log(format!(
+                                "  -> Error de red: {}. Se omite; vuelve a procesar más tarde.",
+                                e
+                            )));
+                            ctx.request_repaint();
+                            continue;
+                        }
+                    };
 
                     if candidatos.is_empty() {
                         let _ = tx.send(MensajeUI::Log(format!(
@@ -360,12 +374,22 @@ impl AppRenombrador {
                     ctx.request_repaint();
                 } else {
                     // Película
-                    let candidatos = buscar_candidatos_pelicula(
+                    let candidatos = match buscar_candidatos_pelicula(
                         &client,
                         &titulo_extraido,
                         &api_key,
                         idioma_titulo,
-                    );
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(MensajeUI::Log(format!(
+                                "  -> Error de red: {}. Se omite; vuelve a procesar más tarde.",
+                                e
+                            )));
+                            ctx.request_repaint();
+                            continue;
+                        }
+                    };
 
                     if candidatos.is_empty() {
                         let _ = tx.send(MensajeUI::Log(format!(
@@ -605,11 +629,14 @@ impl AppRenombrador {
 
         thread::spawn(move || {
             let client = Client::new();
+            // En la búsqueda manual un error de red se muestra como 0
+            // resultados; el usuario puede pulsar "Buscar" de nuevo.
             let candidatos = if es_serie {
                 buscar_candidatos_serie(&client, &query, &api_key, idioma)
             } else {
                 buscar_candidatos_pelicula(&client, &query, &api_key, idioma)
-            };
+            }
+            .unwrap_or_default();
             if let Ok(mut lista) = pendientes_arc.lock() {
                 if let Some(p) = lista.iter_mut().find(|p| p.id == pendiente_id) {
                     p.candidatos = candidatos;
@@ -745,7 +772,7 @@ fn renombrar_episodio_con_id(
     directorio: &str,
 ) -> Result<String, String> {
     let (titulo_serie, _anio) = buscar_nombre_serie(client, api_key, idioma, series_id)
-        .ok_or_else(|| format!("no se pudo obtener info de la serie {}", series_id))?;
+        .map_err(|e| format!("no se pudo obtener info de la serie {}: {}", series_id, e))?;
     let nombre_episodio =
         buscar_nombre_episodio(client, api_key, idioma, series_id, ep.temporada, ep.episodio);
     let titulo_limpio = limpiar_nombre_archivo(&titulo_serie);

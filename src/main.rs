@@ -115,6 +115,7 @@ fn cargar_entorno() -> Result<Entorno, String> {
     let estable = Duration::from_secs(env_parse::<u64>("STABLE_SECS", 60));
     let min_bytes = env_parse::<u64>("MIN_FILE_MB", 50).saturating_mul(1024 * 1024);
     let limpiar_vacios = env_bool("CLEAN_EMPTY_DIRS", false);
+    let dry_run = env_bool("DRY_RUN", false);
 
     let cache_path = PathBuf::from(env_str("CACHE_FILE", "/config/cache.json"));
 
@@ -132,6 +133,7 @@ fn cargar_entorno() -> Result<Entorno, String> {
             accion_dudoso,
             usar_colecciones,
             anio_corchetes,
+            dry_run,
         },
         watch_dir,
         cache_path,
@@ -212,6 +214,12 @@ fn banner(env: &Entorno) {
             env.min_bytes / (1024 * 1024)
         ),
     );
+    if o.dry_run {
+        log(
+            "WARN",
+            "  DRY RUN:        activado — solo se registra lo que se HARÍA; no se mueve nada",
+        );
+    }
 }
 
 fn es_video(path: &Path) -> bool {
@@ -278,6 +286,9 @@ fn bucle(env: &Entorno, client: &Client, cache: &mut SeriesCache) {
     // Archivos que dejamos en su sitio (sin resultados / error / dejar): no se
     // reintentan ni se vuelven a registrar mientras no cambien.
     let mut sin_accion: HashSet<PathBuf> = HashSet::new();
+    // Errores transitorios de red/TMDb: (nº de intentos, no reintentar antes
+    // de). Backoff exponencial con techo para no machacar TMDb en una caída.
+    let mut reintentos: HashMap<PathBuf, (u32, SystemTime)> = HashMap::new();
 
     loop {
         for entrada in WalkDir::new(&env.watch_dir)
@@ -329,9 +340,16 @@ fn bucle(env: &Entorno, client: &Client, cache: &mut SeriesCache) {
             if !estable_ahora || sin_accion.contains(&path) {
                 continue;
             }
+            // En backoff por un error de red anterior: aún no toca reintentar.
+            if let Some((_, hasta)) = reintentos.get(&path) {
+                if SystemTime::now() < *hasta {
+                    continue;
+                }
+            }
 
             log("INFO", format!("Procesando: {}", nombre));
             let padre = path.parent().map(|p| p.to_path_buf());
+            let dry = env.opts.dry_run;
 
             match procesar_archivo(client, &env.opts, cache, &path) {
                 Resultado::Renombrado {
@@ -339,34 +357,52 @@ fn bucle(env: &Entorno, client: &Client, cache: &mut SeriesCache) {
                     score,
                     desde_cache,
                 } => {
+                    let verbo = if dry { "[SIMULADO] movería a" } else { "movido a" };
                     if desde_cache {
-                        log("INFO", format!("  -> [caché] movido a: {}", destino));
+                        log("INFO", format!("  -> [caché] {}: {}", verbo, destino));
                     } else if score >= env.opts.umbral {
-                        log("INFO", format!("  -> movido a: {} (score {:.2})", destino, score));
+                        log("INFO", format!("  -> {}: {} (score {:.2})", verbo, destino, score));
                     } else {
                         log(
                             "WARN",
-                            format!("  -> FORZADO (score {:.2}) movido a: {}", score, destino),
+                            format!("  -> FORZADO (score {:.2}) {}: {}", score, verbo, destino),
                         );
                     }
-                    tamano_previo.remove(&path);
-                    if env.limpiar_vacios {
-                        if let Some(p) = padre {
-                            borrar_dir_vacio_bajo(&p, &env.watch_dir);
+                    reintentos.remove(&path);
+                    if dry {
+                        // El archivo sigue ahí: no lo reprocesamos cada sondeo.
+                        sin_accion.insert(path.clone());
+                    } else {
+                        tamano_previo.remove(&path);
+                        if env.limpiar_vacios {
+                            if let Some(p) = padre {
+                                borrar_dir_vacio_bajo(&p, &env.watch_dir);
+                            }
                         }
                     }
                 }
                 Resultado::EnviadoARevisar { destino, motivo } => {
-                    log("WARN", format!("  -> {} · enviado a revisar: {}", motivo, destino));
-                    tamano_previo.remove(&path);
-                    if env.limpiar_vacios {
-                        if let Some(p) = padre {
-                            borrar_dir_vacio_bajo(&p, &env.watch_dir);
+                    let verbo = if dry {
+                        "[SIMULADO] se enviaría a revisar"
+                    } else {
+                        "enviado a revisar"
+                    };
+                    log("WARN", format!("  -> {} · {}: {}", motivo, verbo, destino));
+                    reintentos.remove(&path);
+                    if dry {
+                        sin_accion.insert(path.clone());
+                    } else {
+                        tamano_previo.remove(&path);
+                        if env.limpiar_vacios {
+                            if let Some(p) = padre {
+                                borrar_dir_vacio_bajo(&p, &env.watch_dir);
+                            }
                         }
                     }
                 }
                 Resultado::DejadoEnSitio { motivo } => {
                     log("WARN", format!("  -> {} · se deja en su sitio", motivo));
+                    reintentos.remove(&path);
                     sin_accion.insert(path.clone());
                 }
                 Resultado::NoEsSerieConEpisodio => {
@@ -374,10 +410,29 @@ fn bucle(env: &Entorno, client: &Client, cache: &mut SeriesCache) {
                         "WARN",
                         "  -> modo serie pero el nombre no tiene patrón de episodio; se ignora",
                     );
+                    reintentos.remove(&path);
                     sin_accion.insert(path.clone());
+                }
+                Resultado::ErrorRed(e) => {
+                    // Transitorio: backoff exponencial (2·intervalo, 4·, 8·…)
+                    // con techo de 15 min. El archivo no se toca.
+                    let intentos = reintentos.get(&path).map(|(n, _)| *n).unwrap_or(0) + 1;
+                    let factor = 2u32.saturating_pow(intentos.min(5));
+                    let espera = (env.intervalo * factor).min(Duration::from_secs(900));
+                    log(
+                        "WARN",
+                        format!(
+                            "  -> {} · reintento {} en ~{}s",
+                            e,
+                            intentos,
+                            espera.as_secs()
+                        ),
+                    );
+                    reintentos.insert(path.clone(), (intentos, SystemTime::now() + espera));
                 }
                 Resultado::Error(e) => {
                     log("ERROR", format!("  -> {}", e));
+                    reintentos.remove(&path);
                     sin_accion.insert(path.clone());
                 }
             }
@@ -386,6 +441,7 @@ fn bucle(env: &Entorno, client: &Client, cache: &mut SeriesCache) {
         // Evitar que los mapas crezcan sin límite: olvidamos lo que ya no existe.
         tamano_previo.retain(|p, _| p.exists());
         sin_accion.retain(|p| p.exists());
+        reintentos.retain(|p, _| p.exists());
 
         thread::sleep(env.intervalo);
     }

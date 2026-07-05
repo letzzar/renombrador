@@ -8,9 +8,10 @@ use crate::mover::mover_seguro;
 use crate::parse::{clave_cache, extraer_info_archivo, limpiar_nombre_archivo, EpisodioInfo};
 use crate::tmdb::{
     buscar_candidatos_pelicula, buscar_candidatos_serie, buscar_coleccion_pelicula,
-    buscar_nombre_episodio, buscar_nombre_serie, Candidato,
+    buscar_nombre_serie, buscar_temporada, Candidato, ErrorTmdb,
 };
 use reqwest::blocking::Client;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Qué hacer cuando TMDb no da un resultado con confianza suficiente.
@@ -49,6 +50,9 @@ pub struct Opciones {
     /// Formato del año en carpetas/archivos: `true` => `Título [2021]`;
     /// `false` => `Título (2021)` (estándar Plex/Jellyfin).
     pub anio_corchetes: bool,
+    /// Modo simulación: se calcula y registra el destino de cada archivo pero
+    /// NO se mueve ni se borra nada. Útil para validar la configuración.
+    pub dry_run: bool,
 }
 
 /// Formatea `Título` + año según la preferencia: `Título (2021)` o `Título [2021]`.
@@ -75,7 +79,21 @@ pub enum Resultado {
         motivo: String,
     },
     NoEsSerieConEpisodio,
+    /// Fallo transitorio de red/TMDb: el archivo NO se toca y conviene
+    /// reintentarlo más tarde (a diferencia de `Error`, que no se reintenta).
+    ErrorRed(String),
     Error(String),
+}
+
+/// Fallo interno al construir/mover, con la granularidad que necesita
+/// `procesar_archivo` para decidir (reintentar, invalidar caché o rendirse).
+enum Fallo {
+    /// Red/TMDb caído: transitorio, reintentable.
+    Red(String),
+    /// El id de serie ya no existe en TMDb (caché obsoleta).
+    SerieNoExiste,
+    /// Error definitivo (p. ej. el destino ya existe): no se reintenta.
+    Definitivo(String),
 }
 
 /// Procesa un único archivo de vídeo de principio a fin.
@@ -109,17 +127,27 @@ pub fn procesar_archivo(
         // Capa 4: si la serie ya está cacheada, saltamos la búsqueda.
         let clave = clave_cache(&titulo);
         if let Some(series_id) = cache.get(&clave) {
-            return match construir_y_mover_serie(client, opts, series_id, ep, path, &ext) {
-                Ok(destino) => Resultado::Renombrado {
-                    destino,
-                    score: 1.0,
-                    desde_cache: true,
-                },
-                Err(e) => Resultado::Error(e),
-            };
+            match construir_y_mover_serie(client, opts, cache, series_id, ep, path, &ext) {
+                Ok(destino) => {
+                    return Resultado::Renombrado {
+                        destino,
+                        score: 1.0,
+                        desde_cache: true,
+                    }
+                }
+                // El id cacheado ya no existe en TMDb: invalidamos la entrada
+                // y seguimos con una búsqueda normal (caché autocurativa).
+                Err(Fallo::SerieNoExiste) => cache.eliminar(&clave),
+                Err(Fallo::Red(e)) => return Resultado::ErrorRed(e),
+                Err(Fallo::Definitivo(e)) => return Resultado::Error(e),
+            }
         }
 
-        let candidatos = buscar_candidatos_serie(client, &titulo, &opts.api_key, opts.idioma);
+        let candidatos =
+            match buscar_candidatos_serie(client, &titulo, &opts.api_key, opts.idioma) {
+                Ok(c) => c,
+                Err(e) => return Resultado::ErrorRed(e.to_string()),
+            };
         if candidatos.is_empty() {
             return manejar_dudoso(opts, path, "sin resultados en TMDb");
         }
@@ -131,19 +159,28 @@ pub fn procesar_archivo(
                 cache.insertar(clave, mejor.id);
             }
             let score = mejor.score;
-            match construir_y_mover_serie(client, opts, mejor.id, ep, path, &ext) {
+            let id = mejor.id;
+            match construir_y_mover_serie(client, opts, cache, id, ep, path, &ext) {
                 Ok(destino) => Resultado::Renombrado {
                     destino,
                     score,
                     desde_cache: false,
                 },
-                Err(e) => Resultado::Error(e),
+                Err(Fallo::Red(e)) => Resultado::ErrorRed(e),
+                Err(Fallo::SerieNoExiste) => {
+                    Resultado::Error(format!("la serie {} no existe en TMDb", id))
+                }
+                Err(Fallo::Definitivo(e)) => Resultado::Error(e),
             }
         } else {
             manejar_dudoso(opts, path, &format!("match dudoso (score {:.2})", mejor.score))
         }
     } else {
-        let candidatos = buscar_candidatos_pelicula(client, &titulo, &opts.api_key, opts.idioma);
+        let candidatos =
+            match buscar_candidatos_pelicula(client, &titulo, &opts.api_key, opts.idioma) {
+                Ok(c) => c,
+                Err(e) => return Resultado::ErrorRed(e.to_string()),
+            };
         if candidatos.is_empty() {
             return manejar_dudoso(opts, path, "sin resultados en TMDb");
         }
@@ -158,7 +195,11 @@ pub fn procesar_archivo(
                     score,
                     desde_cache: false,
                 },
-                Err(e) => Resultado::Error(e),
+                Err(Fallo::Red(e)) => Resultado::ErrorRed(e),
+                Err(Fallo::SerieNoExiste) => {
+                    Resultado::Error(format!("la película {} no existe en TMDb", mejor.id))
+                }
+                Err(Fallo::Definitivo(e)) => Resultado::Error(e),
             }
         } else {
             manejar_dudoso(opts, path, &format!("match dudoso (score {:.2})", mejor.score))
@@ -185,6 +226,12 @@ fn manejar_dudoso(opts: &Opciones, path: &Path, motivo: &str) -> Resultado {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             let destino = opts.dir_revisar.join(&nombre);
+            if opts.dry_run {
+                return Resultado::EnviadoARevisar {
+                    destino: destino.display().to_string(),
+                    motivo: motivo.to_string(),
+                };
+            }
             match mover_seguro(path, &destino) {
                 Ok(_) => Resultado::EnviadoARevisar {
                     destino: destino.display().to_string(),
@@ -207,15 +254,62 @@ fn codigo_episodio(opts: &Opciones, ep: EpisodioInfo) -> String {
 fn construir_y_mover_serie(
     client: &Client,
     opts: &Opciones,
+    cache: &mut SeriesCache,
     series_id: i64,
     ep: EpisodioInfo,
     path: &Path,
     ext: &str,
-) -> Result<String, String> {
-    let (titulo_serie, anio) = buscar_nombre_serie(client, &opts.api_key, opts.idioma, series_id)
-        .ok_or_else(|| format!("no se pudo obtener info de la serie {}", series_id))?;
-    let nombre_ep =
-        buscar_nombre_episodio(client, &opts.api_key, opts.idioma, series_id, ep.temporada, ep.episodio);
+) -> Result<String, Fallo> {
+    // Info de la serie: de la caché en memoria si ya se consultó en esta
+    // ejecución (evita repetir la llamada con cada episodio del lote).
+    let (titulo_serie, anio) = match cache.serie_info(series_id) {
+        Some(info) => info.clone(),
+        None => {
+            let info = match buscar_nombre_serie(client, &opts.api_key, opts.idioma, series_id) {
+                Ok(v) => v,
+                Err(ErrorTmdb::NoEncontrado) => return Err(Fallo::SerieNoExiste),
+                Err(e @ ErrorTmdb::Red(_)) => {
+                    return Err(Fallo::Red(format!(
+                        "no se pudo obtener info de la serie {}: {}",
+                        series_id, e
+                    )))
+                }
+            };
+            cache.insertar_serie_info(series_id, info.0.clone(), info.1.clone());
+            info
+        }
+    };
+
+    // Nombre del episodio: de la caché de temporada si existe; si no, UNA
+    // llamada trae los nombres de toda la temporada y se cachea.
+    let nombre_ep = match cache.temporada(series_id, ep.temporada) {
+        Some(m) => m.get(&ep.episodio).cloned(),
+        None => match buscar_temporada(
+            client,
+            &opts.api_key,
+            opts.idioma,
+            series_id,
+            ep.temporada,
+        ) {
+            Ok(m) => {
+                let nombre = m.get(&ep.episodio).cloned();
+                cache.insertar_temporada(series_id, ep.temporada, m);
+                nombre
+            }
+            // Temporada inexistente en TMDb: seguimos sin nombre de episodio
+            // y cacheamos el vacío para no volver a pedirla.
+            Err(ErrorTmdb::NoEncontrado) => {
+                cache.insertar_temporada(series_id, ep.temporada, HashMap::new());
+                None
+            }
+            Err(e @ ErrorTmdb::Red(_)) => {
+                return Err(Fallo::Red(format!(
+                    "no se pudo obtener la temporada {}: {}",
+                    ep.temporada, e
+                )))
+            }
+        },
+    };
 
     let titulo_limpio = limpiar_nombre_archivo(&titulo_serie);
     let codigo = codigo_episodio(opts, ep);
@@ -239,7 +333,10 @@ fn construir_y_mover_serie(
         opts.dir_series.join(&archivo)
     };
 
-    mover_seguro(path, &destino)?;
+    if opts.dry_run {
+        return Ok(destino.display().to_string());
+    }
+    mover_seguro(path, &destino).map_err(Fallo::Definitivo)?;
     Ok(destino.display().to_string())
 }
 
@@ -249,7 +346,7 @@ fn construir_y_mover_pelicula(
     candidato: &Candidato,
     path: &Path,
     ext: &str,
-) -> Result<String, String> {
+) -> Result<String, Fallo> {
     let titulo_limpio = limpiar_nombre_archivo(&candidato.titulo);
     let tiene_anio = candidato.anio != "0000";
 
@@ -266,13 +363,23 @@ fn construir_y_mover_pelicula(
         // caracteres inválidos para el sistema de archivos).
         let mut base_dir = opts.dir_peliculas.clone();
         if opts.usar_colecciones {
-            if let Some(coleccion) =
-                buscar_coleccion_pelicula(client, &opts.api_key, opts.idioma, candidato.id)
-            {
-                let coleccion_limpia = limpiar_nombre_archivo(&coleccion);
-                if !coleccion_limpia.is_empty() {
-                    base_dir = base_dir.join(coleccion_limpia);
+            match buscar_coleccion_pelicula(client, &opts.api_key, opts.idioma, candidato.id) {
+                Ok(Some(coleccion)) => {
+                    let coleccion_limpia = limpiar_nombre_archivo(&coleccion);
+                    if !coleccion_limpia.is_empty() {
+                        base_dir = base_dir.join(coleccion_limpia);
+                    }
                 }
+                Ok(None) => {}
+                // Con la red caída no sabemos si tiene colección: mejor
+                // reintentar luego que colocarla sin su carpeta de saga.
+                Err(e @ ErrorTmdb::Red(_)) => {
+                    return Err(Fallo::Red(format!(
+                        "no se pudo comprobar la colección: {}",
+                        e
+                    )))
+                }
+                Err(ErrorTmdb::NoEncontrado) => {}
             }
         }
         base_dir.join(&carpeta_pelicula).join(&archivo)
@@ -285,6 +392,9 @@ fn construir_y_mover_pelicula(
         opts.dir_peliculas.join(format!("{}.{}", base, ext))
     };
 
-    mover_seguro(path, &destino)?;
+    if opts.dry_run {
+        return Ok(destino.display().to_string());
+    }
+    mover_seguro(path, &destino).map_err(Fallo::Definitivo)?;
     Ok(destino.display().to_string())
 }

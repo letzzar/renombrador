@@ -8,7 +8,10 @@ A native Windows desktop app built in Rust (egui) that renames movie and TV show
 
 > **🐳 Running on Linux / a NAS?** There is now a headless **Docker service** that
 > watches your downloads folder and automatically renames + moves new videos into
-> your movies/series libraries (Plex/Jellyfin layout). See **[DOCKER.md](DOCKER.md)**.
+> your movies/series libraries (Plex/Jellyfin layout). It survives network outages
+> (automatic retries with backoff), batches TMDb calls per season, and has a
+> `DRY_RUN` mode to preview everything before touching a single file.
+> See **[DOCKER.md](DOCKER.md)**.
 
 ## Features
 
@@ -70,7 +73,9 @@ App de escritorio nativa para Windows construida en Rust (egui) que renombra arc
 > **🐳 ¿Lo quieres en Linux / un NAS?** Ahora hay un **servicio Docker** sin
 > interfaz que vigila tu carpeta de descargas y renombra + mueve automáticamente
 > los vídeos nuevos a tus carpetas de películas/series (estructura Plex/Jellyfin).
-> Consulta **[DOCKER.md](DOCKER.md)**.
+> Aguanta caídas de red (reintentos automáticos con backoff), agrupa las llamadas
+> a TMDb por temporada y tiene un modo `DRY_RUN` para previsualizarlo todo sin
+> tocar un solo archivo. Consulta **[DOCKER.md](DOCKER.md)**.
 
 ## Características
 

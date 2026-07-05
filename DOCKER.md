@@ -29,11 +29,22 @@ interaction.
 5. If it is **not** confident, it applies the `ON_UNCERTAIN` policy (by default,
    move to `downloads/_revisar` so you can check it by hand).
 6. It caches the resolved series id in `/config/cache.json`, so the next
-   episodes are renamed instantly without searching again.
+   episodes are renamed instantly without searching again. Episode names are
+   fetched **one season at a time** and kept in memory, so a full-season batch
+   costs ~2 TMDb calls instead of 2 per episode.
+7. If TMDb is **unreachable** (network down, timeout, server error), files are
+   **left untouched** and retried with exponential backoff (2·, 4·, 8·… the
+   poll interval, capped at 15 min). A network outage never sends files to
+   quarantine.
 
 > Moving is safe: it **never overwrites** a different existing file, and it works
-> even when downloads and movies live on **different volumes** (it copies and
-> deletes if `rename` can't cross filesystems).
+> even when downloads and movies live on **different volumes** (it copies to a
+> temporary `.part` file and renames at the end, so a crash mid-copy never
+> leaves a half-written video at the destination).
+
+> **Tip — first run:** set `DRY_RUN=true` and watch the log. The service prints
+> the exact destination it *would* use for every file without moving anything.
+> When you are happy with the result, set it back to `false`.
 
 ---
 
@@ -99,6 +110,7 @@ Helper scripts: `./scripts/start.sh`, `./scripts/logs.sh`, `./scripts/stop.sh`.
 | `FORCE_MODE`       | `auto`                 | `auto` (detect by name), `series` or `movies`. |
 | `ON_UNCERTAIN`     | `revisar`              | Doubtful match: `revisar` (quarantine), `dejar` (leave), `forzar` (use best anyway). |
 | `MATCH_THRESHOLD`  | `0.85`                 | Similarity threshold [0..1] to rename without doubt. |
+| `DRY_RUN`          | `false`                | `true` = log what *would* be done (calculated destinations) without moving anything. |
 | `POLL_INTERVAL`    | `30`                   | Seconds between folder scans. |
 | `STABLE_SECS`      | `60`                   | Seconds a file must be unchanged before processing. |
 | `MIN_FILE_MB`      | `50`                   | Minimum size (MB); skips *samples*. |
@@ -176,7 +188,8 @@ docker compose down               # stop and remove
 | Nothing detected | Wrong `DOWNLOADS_DIR`? File below `MIN_FILE_MB`? Extension not `.mkv/.mp4/.avi`? |
 | Slow to react | Normal: it waits `STABLE_SECS` + one `POLL_INTERVAL`. Lower them for more reactivity. |
 | Everything goes to `_revisar` | Very messy names or wrong language. Lower `MATCH_THRESHOLD` or change `TMDB_LANGUAGE`; the log shows the score. |
-| Wrong show matched | Edit/remove its entry in `/config/cache.json` and restart. |
+| `TMDb no accesible … reintento N en ~Xs` | Network/TMDb outage (or invalid API key → `HTTP 401`). Files are left in place and retried automatically with backoff. |
+| Wrong show matched | Edit/remove its entry in `/config/cache.json` and restart (stale ids that no longer exist in TMDb are dropped automatically). |
 | `code: 101` when building | Toolchain too old; the `Dockerfile` uses `rust:1-slim-bookworm` (latest stable). |
 
 ---
@@ -213,11 +226,22 @@ intervención humana.
 5. Si **no** está seguro, aplica la política de `ON_UNCERTAIN` (por defecto,
    mover a `descargas/_revisar/` para que lo mires a mano).
 6. Guarda en `/config/cache.json` el `id` de cada serie ya resuelta, para que los
-   siguientes episodios se renombren al instante.
+   siguientes episodios se renombren al instante. Los nombres de episodio se
+   piden **temporada a temporada** y se guardan en memoria: un lote con una
+   temporada entera cuesta ~2 llamadas a TMDb en vez de 2 por capítulo.
+7. Si TMDb **no responde** (red caída, timeout, error del servidor), los
+   archivos se **dejan intactos** y se reintentan con espera creciente (2·, 4·,
+   8·… el intervalo de sondeo, con techo de 15 min). Una caída de red nunca
+   manda archivos a cuarentena.
 
 > El movimiento es seguro: **nunca sobreescribe** un archivo distinto, y funciona
-> aunque descargas y películas estén en **volúmenes diferentes** (copia y borra
-> si `rename` no puede cruzar discos).
+> aunque descargas y películas estén en **volúmenes diferentes** (copia a un
+> archivo temporal `.part` y renombra al final, así un corte a media copia nunca
+> deja un vídeo a medias en el destino).
+
+> **Consejo — primer arranque:** pon `DRY_RUN=true` y mira el log. El servicio
+> imprime el destino exacto que *usaría* para cada archivo sin mover nada.
+> Cuando el resultado te convenza, vuelve a ponerlo en `false`.
 
 ---
 
@@ -284,6 +308,7 @@ Scripts de ayuda: `./scripts/start.sh`, `./scripts/logs.sh`, `./scripts/stop.sh`
 | `FORCE_MODE`       | `auto`                 | `auto` (detecta por nombre), `series` o `movies`. |
 | `ON_UNCERTAIN`     | `revisar`              | Match dudoso: `revisar` (cuarentena), `dejar` (no tocar), `forzar` (usar el mejor). |
 | `MATCH_THRESHOLD`  | `0.85`                 | Umbral de similitud [0..1] para renombrar sin dudar. |
+| `DRY_RUN`          | `false`                | `true` = registrar lo que se *haría* (destinos calculados) sin mover nada. |
 | `POLL_INTERVAL`    | `30`                   | Segundos entre cada revisión de la carpeta. |
 | `STABLE_SECS`      | `60`                   | Segundos que un archivo debe estar quieto antes de procesarlo. |
 | `MIN_FILE_MB`      | `50`                   | Tamaño mínimo (MB); descarta *samples*. |
@@ -361,7 +386,8 @@ docker compose down               # parar y eliminar
 | No detecta archivos | ¿`DOWNLOADS_DIR` correcta? ¿Supera `MIN_FILE_MB`? ¿Extensión `.mkv/.mp4/.avi`? |
 | Tarda en procesar | Normal: espera `STABLE_SECS` + un ciclo de `POLL_INTERVAL`. Bájalos si quieres más reactividad. |
 | Todo va a `_revisar` | Nombres muy sucios o idioma equivocado. Baja `MATCH_THRESHOLD` o cambia `TMDB_LANGUAGE`; el log muestra el score. |
-| Serie mal identificada | Borra/edita su entrada en `/config/cache.json` y reinicia. |
+| `TMDb no accesible … reintento N en ~Xs` | Caída de red/TMDb (o API key inválida → `HTTP 401`). Los archivos se dejan en su sitio y se reintentan solos con backoff. |
+| Serie mal identificada | Borra/edita su entrada en `/config/cache.json` y reinicia (los ids obsoletos que ya no existen en TMDb se descartan solos). |
 | `code: 101` al compilar | Toolchain demasiado antiguo; el `Dockerfile` usa `rust:1-slim-bookworm` (último estable). |
 
 ---
