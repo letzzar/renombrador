@@ -16,6 +16,18 @@ short_description = "Renombrador de series y películas"
 copyright = "Copyright (c) 2026 letzzar. GPL-3.0."
 osx_minimum_system_version = "11.0"
 
+# cargo-bundle busca metadatos por binario cuando se empaqueta con `--bin`.
+# Sin esta sección no aplica el icono ni el identificador de arriba al
+# empaquetar `renombrador-gui`.
+[package.metadata.bundle.bin.renombrador-gui]
+name = "Renombrador"
+identifier = "com.letzzar.renombrador"
+icon = ["build/icon.icns"]
+category = "public.app-category.utilities"
+short_description = "Renombrador de series y películas"
+copyright = "Copyright (c) 2026 letzzar. GPL-3.0."
+osx_minimum_system_version = "11.0"
+
 # Lógica pura compartida (parseo de nombres, llamadas a TMDb, movimiento de
 # archivos, caché). La usan tanto el servicio como la GUI.
 [lib]
