@@ -5,7 +5,7 @@
 use crate::cache::SeriesCache;
 use crate::config::Idioma;
 use crate::mover::mover_seguro;
-use crate::parse::{clave_cache, extraer_info_archivo, limpiar_nombre_archivo, EpisodioInfo};
+use crate::parse::{clave_cache_titulo, extraer_info_archivo, limpiar_nombre_archivo, EpisodioInfo};
 use crate::tmdb::{
     buscar_candidatos_pelicula, buscar_candidatos_serie, buscar_coleccion_pelicula,
     buscar_nombre_serie, buscar_temporada, Candidato, ErrorTmdb,
@@ -112,7 +112,7 @@ pub fn procesar_archivo(
         None => return Resultado::Error("el archivo no tiene extensión".to_string()),
     };
 
-    let (titulo, ep_info) = extraer_info_archivo(&nombre);
+    let (titulo, anio_archivo, ep_info) = extraer_info_archivo(&nombre);
     let como_serie = match opts.forzar_series {
         Some(v) => v,
         None => ep_info.is_some(),
@@ -125,7 +125,7 @@ pub fn procesar_archivo(
         };
 
         // Capa 4: si la serie ya está cacheada, saltamos la búsqueda.
-        let clave = clave_cache(&titulo);
+        let clave = clave_cache_titulo(&titulo, anio_archivo);
         if let Some(series_id) = cache.get(&clave) {
             match construir_y_mover_serie(client, opts, cache, series_id, ep, path, &ext) {
                 Ok(destino) => {
@@ -143,17 +143,23 @@ pub fn procesar_archivo(
             }
         }
 
-        let candidatos =
-            match buscar_candidatos_serie(client, &titulo, &opts.api_key, opts.idioma) {
-                Ok(c) => c,
-                Err(e) => return Resultado::ErrorRed(e.to_string()),
-            };
+        let candidatos = match buscar_candidatos_serie(
+            client,
+            &titulo,
+            anio_archivo,
+            &opts.api_key,
+            opts.idioma,
+        ) {
+            Ok(c) => c,
+            Err(e) => return Resultado::ErrorRed(e.to_string()),
+        };
         if candidatos.is_empty() {
             return manejar_dudoso(opts, path, "sin resultados en TMDb");
         }
 
         let mejor = &candidatos[0];
-        let confiado = mejor.score >= opts.umbral;
+        // Un candidato de variante desesperada nunca auto-renombra por score.
+        let confiado = mejor.score >= opts.umbral && mejor.fiable;
         if confiado || opts.accion_dudoso == AccionDudoso::Forzar {
             if confiado {
                 cache.insertar(clave, mejor.id);
@@ -176,17 +182,23 @@ pub fn procesar_archivo(
             manejar_dudoso(opts, path, &format!("match dudoso (score {:.2})", mejor.score))
         }
     } else {
-        let candidatos =
-            match buscar_candidatos_pelicula(client, &titulo, &opts.api_key, opts.idioma) {
-                Ok(c) => c,
-                Err(e) => return Resultado::ErrorRed(e.to_string()),
-            };
+        let candidatos = match buscar_candidatos_pelicula(
+            client,
+            &titulo,
+            anio_archivo,
+            &opts.api_key,
+            opts.idioma,
+        ) {
+            Ok(c) => c,
+            Err(e) => return Resultado::ErrorRed(e.to_string()),
+        };
         if candidatos.is_empty() {
             return manejar_dudoso(opts, path, "sin resultados en TMDb");
         }
 
         let mejor = &candidatos[0];
-        let confiado = mejor.score >= opts.umbral;
+        // Un candidato de variante desesperada nunca auto-renombra por score.
+        let confiado = mejor.score >= opts.umbral && mejor.fiable;
         if confiado || opts.accion_dudoso == AccionDudoso::Forzar {
             let score = mejor.score;
             match construir_y_mover_pelicula(client, opts, mejor, path, &ext) {

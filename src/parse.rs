@@ -7,6 +7,7 @@ use regex::Regex;
 use std::path::Path;
 use std::sync::OnceLock;
 use strsim::jaro_winkler;
+use unicode_normalization::UnicodeNormalization;
 
 /// Compila un regex una sola vez por proceso (los patrones son constantes y
 /// `Regex::new` es costoso; antes se recompilaban con cada archivo).
@@ -23,20 +24,32 @@ pub struct EpisodioInfo {
     pub episodio: u32,
 }
 
-/// Extrae el título "limpio" y, si lo detecta, la info de temporada/episodio
-/// a partir del nombre de archivo.
+/// Extrae el título "limpio", el año de estreno (si aparece) y, si la
+/// detecta, la info de temporada/episodio a partir del nombre de archivo.
+///
+/// El año se devuelve **separado** del título: la API de TMDb no entiende
+/// queries con el año incrustado (`"Dune 2021"` da 0 resultados), pero sí
+/// acepta el parámetro `primary_release_year`/`first_air_date_year`, que es
+/// donde acaba este valor. Así el año sigue sirviendo para diferenciar
+/// remakes sin sabotear la búsqueda.
 ///
 /// Sobre el original se añade limpieza de "etiquetas de release" típicas de
 /// eMule/torrents (resolución, fuente, códec, audio, grupo entre corchetes…)
 /// para que el título que se busca en TMDb sea el de verdad y no
 /// `Dune 2021 1080p BluRay x264 GRUPO`.
-pub fn extraer_info_archivo(nombre_archivo: &str) -> (String, Option<EpisodioInfo>) {
+pub fn extraer_info_archivo(
+    nombre_archivo: &str,
+) -> (String, Option<u32>, Option<EpisodioInfo>) {
     let path = Path::new(nombre_archivo);
-    let nombre_sin_ext = path
+    // Normalizar a NFC: los sistemas de archivos de macOS guardan los nombres
+    // en NFD ("Á" = "A" + tilde combinante) y la búsqueda de TMDb devuelve 0
+    // resultados para queries NFD. Con NFC el título funciona en todas partes.
+    let nombre_sin_ext: String = path
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy()
-        .to_string();
+        .nfc()
+        .collect();
 
     // Quitar segmentos entre corchetes/llaves: [YTS.MX], {eztv}, [www.web.com]…
     let re_corchetes = regex_estatico!(r"[\[\{][^\]\}]*[\]\}]");
@@ -65,12 +78,16 @@ pub fn extraer_info_archivo(nombre_archivo: &str) -> (String, Option<EpisodioInf
         &sin_corchetes
     };
 
-    // Conservamos el año aunque venga entre paréntesis: "(2014)" -> " 2014 ".
-    // El año es útil para diferenciar remakes ("Dune (1984)" vs "Dune (2021)")
-    // y series ("Doctor Who (2005)"), así que NO lo eliminamos; las etiquetas
-    // de release que pudieran ir después se recortan luego.
+    // Año entre paréntesis: "(2014)". Es la señal más fiable del año de
+    // estreno, así que lo capturamos (el último si hubiera varios) y lo
+    // quitamos del título para que la query a TMDb vaya limpia.
     let re_año = regex_estatico!(r"\(\s*([12]\d{3})\s*\)");
-    let titulo_sin_metadata = re_año.replace_all(titulo_antes_episodio, " $1 ");
+    let mut anio: Option<u32> = re_año
+        .captures_iter(titulo_antes_episodio)
+        .last()
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse().ok());
+    let titulo_sin_metadata = re_año.replace_all(titulo_antes_episodio, " ");
 
     // Capa 1: limpieza no destructiva. Sustituimos solo separadores típicos
     // de nombres de release (puntos, guiones bajos, guiones) por espacios y
@@ -89,9 +106,26 @@ pub fn extraer_info_archivo(nombre_archivo: &str) -> (String, Option<EpisodioInf
 
     // Colapsar espacios.
     let re_espacios = regex_estatico!(r"\s+");
-    let limpio = re_espacios.replace_all(&limpio, " ").trim().to_string();
+    let mut limpio = re_espacios.replace_all(&limpio, " ").trim().to_string();
 
-    (limpio, episodio_info)
+    // Año "suelto" al final del título ya recortado: "Dune 2021" -> ("Dune",
+    // 2021). Solo el último token, solo si parece un año de cine y solo si no
+    // deja el título vacío ("1917" a secas ES el título, no un año). Un año
+    // anterior entre paréntesis tiene prioridad: "Blade Runner 2049 (2017)"
+    // ya resolvió anio=2017 y aquí no se toca el "2049".
+    if anio.is_none() {
+        let tokens: Vec<&str> = limpio.split_whitespace().collect();
+        if tokens.len() > 1 {
+            if let Ok(a) = tokens[tokens.len() - 1].parse::<u32>() {
+                if (1900..=2099).contains(&a) {
+                    anio = Some(a);
+                    limpio = tokens[..tokens.len() - 1].join(" ");
+                }
+            }
+        }
+    }
+
+    (limpio, anio, episodio_info)
 }
 
 /// Convierte una captura `NxNN` / `SxxExx` en `(EpisodioInfo, posición)`,
@@ -208,38 +242,50 @@ pub fn palabras_fuertes(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Genera variantes de búsqueda en orden de prioridad. Cada variante es un par
-/// (query, idioma) para ir probando contra TMDb hasta encontrar algo útil.
-pub fn variantes_busqueda(titulo: &str, idioma: Idioma) -> Vec<(String, Idioma)> {
-    let mut vs: Vec<(String, Idioma)> = Vec::new();
+/// Una query candidata contra TMDb, con el idioma en que buscar y si el
+/// resultado puede considerarse fiable para renombrar automáticamente.
+#[derive(Clone, Debug)]
+pub struct Variante {
+    pub query: String,
+    pub idioma: Idioma,
+    /// `false` en las variantes "desesperadas" (una sola palabra): recuperan
+    /// demasiada morralla como para auto-renombrar por encima del umbral.
+    /// Sus resultados solo valen como sugerencias para revisión manual.
+    pub fiable: bool,
+}
+
+/// Genera variantes de búsqueda en orden de prioridad, para ir probando
+/// contra TMDb hasta encontrar algo útil.
+pub fn variantes_busqueda(titulo: &str, idioma: Idioma) -> Vec<Variante> {
+    let mut vs: Vec<Variante> = Vec::new();
     let base = titulo.trim().to_string();
     if base.is_empty() {
         return vs;
     }
 
-    let agregar = |vs: &mut Vec<(String, Idioma)>, q: String, l: Idioma| {
+    let agregar = |vs: &mut Vec<Variante>, q: String, l: Idioma, fiable: bool| {
         let q = q.trim().to_string();
         if q.is_empty() {
             return;
         }
-        if !vs.iter().any(|(qq, ll)| qq == &q && *ll == l) {
-            vs.push((q, l));
+        if !vs.iter().any(|v| v.query == q && v.idioma == l) {
+            vs.push(Variante { query: q, idioma: l, fiable });
         }
     };
 
     // 1) Título completo en idioma elegido.
-    agregar(&mut vs, base.clone(), idioma);
+    agregar(&mut vs, base.clone(), idioma, true);
 
     // 2) Mismo título en inglés (TMDb suele tener el original en EN).
     if idioma != Idioma::EnUS {
-        agregar(&mut vs, base.clone(), Idioma::EnUS);
+        agregar(&mut vs, base.clone(), Idioma::EnUS, true);
     }
 
     // 3) Sin artículo líder.
     if let Some(sin_art) = quitar_articulo_lider(&base) {
-        agregar(&mut vs, sin_art.clone(), idioma);
+        agregar(&mut vs, sin_art.clone(), idioma, true);
         if idioma != Idioma::EnUS {
-            agregar(&mut vs, sin_art, Idioma::EnUS);
+            agregar(&mut vs, sin_art, Idioma::EnUS, true);
         }
     }
 
@@ -248,16 +294,20 @@ pub fn variantes_busqueda(titulo: &str, idioma: Idioma) -> Vec<(String, Idioma)>
     for n in [4usize, 3, 2] {
         if palabras.len() > n {
             let sufijo: String = palabras[palabras.len() - n..].join(" ");
-            agregar(&mut vs, sufijo.clone(), idioma);
+            agregar(&mut vs, sufijo.clone(), idioma, true);
             if idioma != Idioma::EnUS {
-                agregar(&mut vs, sufijo, Idioma::EnUS);
+                agregar(&mut vs, sufijo, Idioma::EnUS, true);
             }
         }
     }
 
-    // 5) Primera palabra fuerte (último intento desesperado).
-    if let Some(primera) = palabras.first() {
-        agregar(&mut vs, primera.clone(), idioma);
+    // 5) Primera palabra fuerte (último intento desesperado, no fiable).
+    // Solo tiene sentido si el título tenía más de una palabra; si no, ya
+    // está cubierto por la variante 1.
+    if palabras.len() >= 2 {
+        if let Some(primera) = palabras.first() {
+            agregar(&mut vs, primera.clone(), idioma, false);
+        }
     }
 
     vs
@@ -271,6 +321,17 @@ pub fn similitud(query: &str, titulo: &str, nombre_original: &str) -> f64 {
     let a = jaro_winkler(&q, &titulo.to_lowercase());
     let b = jaro_winkler(&q, &nombre_original.to_lowercase());
     a.max(b)
+}
+
+/// Clave de caché para un título con año opcional. Incluir el año evita que
+/// dos series homónimas de distinto año ("Doctor Who" 1963/2005) compartan
+/// entrada; además mantiene compatibilidad con cachés antiguas, cuyas claves
+/// se generaban con el año dentro del título.
+pub fn clave_cache_titulo(titulo: &str, anio: Option<u32>) -> String {
+    match anio {
+        Some(a) => clave_cache(&format!("{} {}", titulo, a)),
+        None => clave_cache(titulo),
+    }
 }
 
 /// Clave de caché: título normalizado (lower + colapso de espacios). Se usa
@@ -298,64 +359,95 @@ pub fn limpiar_nombre_archivo(nombre: &str) -> String {
 mod tests {
     use super::*;
 
-    fn titulo(n: &str) -> String {
-        extraer_info_archivo(n).0
+    fn titulo_y_anio(n: &str) -> (String, Option<u32>) {
+        let (t, a, _) = extraer_info_archivo(n);
+        (t, a)
     }
 
     #[test]
     fn pelicula_con_tags_de_release() {
-        assert_eq!(titulo("Dune.2021.1080p.BluRay.x264-GROUP.mkv"), "Dune 2021");
-        assert_eq!(titulo("The.Matrix.1999.1080p.BluRay.x264.mkv"), "The Matrix 1999");
         assert_eq!(
-            titulo("Top.Gun.Maverick.2022.2160p.UHD.BluRay.x265-TERMINAL.mkv"),
-            "Top Gun Maverick 2022"
+            titulo_y_anio("Dune.2021.1080p.BluRay.x264-GROUP.mkv"),
+            ("Dune".to_string(), Some(2021))
+        );
+        assert_eq!(
+            titulo_y_anio("The.Matrix.1999.1080p.BluRay.x264.mkv"),
+            ("The Matrix".to_string(), Some(1999))
+        );
+        assert_eq!(
+            titulo_y_anio("Top.Gun.Maverick.2022.2160p.UHD.BluRay.x265-TERMINAL.mkv"),
+            ("Top Gun Maverick".to_string(), Some(2022))
         );
     }
 
     #[test]
     fn conserva_anios_que_son_parte_del_titulo() {
-        // No debe cortar en el año cuando forma parte del título.
+        // El año de estreno se separa; el que forma parte del título se queda.
         assert_eq!(
-            titulo("Blade.Runner.2049.2017.2160p.BluRay.x265.mkv"),
-            "Blade Runner 2049 2017"
+            titulo_y_anio("Blade.Runner.2049.2017.2160p.BluRay.x265.mkv"),
+            ("Blade Runner 2049".to_string(), Some(2017))
         );
-        assert_eq!(titulo("1917.2019.1080p.BluRay.x264.mkv"), "1917 2019");
+        assert_eq!(
+            titulo_y_anio("1917.2019.1080p.BluRay.x264.mkv"),
+            ("1917".to_string(), Some(2019))
+        );
+        // Un título que ES un año no debe quedarse vacío.
+        assert_eq!(titulo_y_anio("1917.mkv"), ("1917".to_string(), None));
     }
 
     #[test]
-    fn quita_corchetes_pero_conserva_el_anio() {
+    fn quita_corchetes_y_separa_el_anio() {
         assert_eq!(
-            titulo("[YTS.MX] Interstellar (2014) [1080p].mkv"),
-            "Interstellar 2014"
-        );
-    }
-
-    #[test]
-    fn conserva_anio_entre_parentesis() {
-        // El año entre paréntesis debe conservarse (diferencia remakes).
-        assert_eq!(titulo("Inception (2010).mkv"), "Inception 2010");
-        assert_eq!(
-            titulo("Dune (1984) 1080p BluRay x264.mkv"),
-            "Dune 1984"
+            titulo_y_anio("[YTS.MX] Interstellar (2014) [1080p].mkv"),
+            ("Interstellar".to_string(), Some(2014))
         );
     }
 
     #[test]
-    fn serie_conserva_anio_en_el_titulo() {
-        let (t, ep) = extraer_info_archivo("Doctor.Who.(2005).S01E01.1080p.HDTV.mkv");
-        assert_eq!(t, "Doctor Who 2005");
+    fn anio_entre_parentesis_tiene_prioridad() {
+        assert_eq!(
+            titulo_y_anio("Inception (2010).mkv"),
+            ("Inception".to_string(), Some(2010))
+        );
+        assert_eq!(
+            titulo_y_anio("Dune (1984) 1080p BluRay x264.mkv"),
+            ("Dune".to_string(), Some(1984))
+        );
+        // El paréntesis fija el año; el "2049" del título no se toca.
+        assert_eq!(
+            titulo_y_anio("Blade Runner 2049 (2017).mkv"),
+            ("Blade Runner 2049".to_string(), Some(2017))
+        );
+    }
+
+    #[test]
+    fn pelicula_con_titulo_acentuado_y_tags_entre_parentesis() {
+        // Caso real: el año va entre paréntesis y los tags también.
+        assert_eq!(
+            titulo_y_anio(
+                "Águilas.de.El.Cairo.(2025).(Spanish.Arabic.Subs).WEB-DL.1080p.x264-EAC3.by.xusman.(nocturniap2p).mkv"
+            ),
+            ("Águilas de El Cairo".to_string(), Some(2025))
+        );
+    }
+
+    #[test]
+    fn serie_separa_anio_del_titulo() {
+        let (t, a, ep) = extraer_info_archivo("Doctor.Who.(2005).S01E01.1080p.HDTV.mkv");
+        assert_eq!(t, "Doctor Who");
+        assert_eq!(a, Some(2005));
         assert_eq!(ep.unwrap().temporada, 1);
         assert_eq!(ep.unwrap().episodio, 1);
     }
 
     #[test]
     fn series_extrae_episodio_y_titulo() {
-        let (t, ep) = extraer_info_archivo("Severance.S01E01.1080p.WEB.mkv");
+        let (t, _, ep) = extraer_info_archivo("Severance.S01E01.1080p.WEB.mkv");
         assert_eq!(t, "Severance");
         assert_eq!(ep.unwrap().temporada, 1);
         assert_eq!(ep.unwrap().episodio, 1);
 
-        let (t2, ep2) = extraer_info_archivo("Los.Simpson.12x08.WEB-DL.mkv");
+        let (t2, _, ep2) = extraer_info_archivo("Los.Simpson.12x08.WEB-DL.mkv");
         assert_eq!(t2, "Los Simpson");
         assert_eq!(ep2.unwrap().temporada, 12);
         assert_eq!(ep2.unwrap().episodio, 8);
@@ -364,13 +456,39 @@ mod tests {
     #[test]
     fn resolucion_wxh_no_es_episodio() {
         // "1920x1080" no debe interpretarse como temporada 1920.
-        let (_, ep) = extraer_info_archivo("Pelicula.1920x1080.x264.mkv");
+        let (_, _, ep) = extraer_info_archivo("Pelicula.1920x1080.x264.mkv");
         assert!(ep.is_none());
     }
 
     #[test]
     fn no_corta_titulos_de_una_palabra_que_son_tag() {
         // El primer token nunca se corta aunque sea una etiqueta.
-        assert_eq!(titulo("Cam.2018.1080p.WEBRip.mkv"), "Cam 2018");
+        assert_eq!(
+            titulo_y_anio("Cam.2018.1080p.WEBRip.mkv"),
+            ("Cam".to_string(), Some(2018))
+        );
+    }
+
+    #[test]
+    fn normaliza_nfd_a_nfc() {
+        // Nombre como lo guarda macOS: "Á" descompuesta (A + U+0301).
+        let nfd = "A\u{0301}guilas.de.El.Cairo.(2025).WEB-DL.mkv";
+        let (t, a, _) = extraer_info_archivo(nfd);
+        // El título resultante debe ser NFC ("Á" precompuesta, U+00C1).
+        assert_eq!(t, "\u{c1}guilas de El Cairo");
+        assert_eq!(a, Some(2025));
+    }
+
+    #[test]
+    fn variante_de_una_palabra_no_es_fiable() {
+        let vs = variantes_busqueda("Águilas de El Cairo", Idioma::EsES);
+        // La primera variante (título completo) es fiable.
+        assert!(vs[0].fiable);
+        // La última (palabra suelta "águilas") no lo es.
+        let desesperada = vs.iter().find(|v| v.query == "águilas").unwrap();
+        assert!(!desesperada.fiable);
+        // Un título de una sola palabra no genera variante desesperada.
+        let vs1 = variantes_busqueda("Severance", Idioma::EsES);
+        assert!(vs1.iter().all(|v| v.fiable));
     }
 }

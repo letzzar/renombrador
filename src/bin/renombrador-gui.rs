@@ -21,7 +21,9 @@ use std::{
 
 use renombrador::config::Idioma;
 use renombrador::mover::renombrar_si_seguro;
-use renombrador::parse::{clave_cache, extraer_info_archivo, limpiar_nombre_archivo, EpisodioInfo};
+use renombrador::parse::{
+    clave_cache_titulo, extraer_info_archivo, limpiar_nombre_archivo, EpisodioInfo,
+};
 use renombrador::tmdb::{
     buscar_candidatos_pelicula, buscar_candidatos_serie, buscar_nombre_episodio,
     buscar_nombre_serie, Candidato,
@@ -60,6 +62,8 @@ struct Pendiente {
     id: u64,
     ruta_original: PathBuf,
     titulo_extraido: String,
+    /// Año de estreno extraído del nombre de archivo, si lo traía.
+    anio_extraido: Option<u32>,
     episodio_info: Option<EpisodioInfo>,
     es_serie: bool,
     extension: String,
@@ -227,7 +231,8 @@ impl AppRenombrador {
                 let _ = tx.send(MensajeUI::Log(format!("Procesando: {}", nombre_archivo)));
                 ctx.request_repaint();
 
-                let (titulo_extraido, episodio_info) = extraer_info_archivo(&nombre_archivo);
+                let (titulo_extraido, anio_extraido, episodio_info) =
+                    extraer_info_archivo(&nombre_archivo);
                 let tratar_como_serie = modo_series || episodio_info.is_some();
 
                 if tratar_como_serie {
@@ -243,7 +248,7 @@ impl AppRenombrador {
                     };
 
                     // Capa 4: si la serie está cacheada, saltar búsqueda.
-                    let clave = clave_cache(&titulo_extraido);
+                    let clave = clave_cache_titulo(&titulo_extraido, anio_extraido);
                     let id_cacheado = cache_arc
                         .lock()
                         .ok()
@@ -282,6 +287,7 @@ impl AppRenombrador {
                     let candidatos = match buscar_candidatos_serie(
                         &client,
                         &titulo_extraido,
+                        anio_extraido,
                         &api_key,
                         idioma_titulo,
                     ) {
@@ -311,6 +317,7 @@ impl AppRenombrador {
                             id,
                             ruta_original: path.clone(),
                             titulo_extraido: titulo_extraido.clone(),
+                            anio_extraido,
                             episodio_info: Some(ep),
                             es_serie: true,
                             extension: ext.clone(),
@@ -324,7 +331,8 @@ impl AppRenombrador {
                     }
 
                     let mejor = &candidatos[0];
-                    if mejor.score >= UMBRAL_AUTO {
+                    // La variante desesperada nunca auto-renombra por score.
+                    if mejor.score >= UMBRAL_AUTO && mejor.fiable {
                         match renombrar_episodio_con_id(
                             &client,
                             &api_key,
@@ -362,6 +370,7 @@ impl AppRenombrador {
                             id,
                             ruta_original: path.clone(),
                             titulo_extraido: titulo_extraido.clone(),
+                            anio_extraido,
                             episodio_info: Some(ep),
                             es_serie: true,
                             extension: ext.clone(),
@@ -377,6 +386,7 @@ impl AppRenombrador {
                     let candidatos = match buscar_candidatos_pelicula(
                         &client,
                         &titulo_extraido,
+                        anio_extraido,
                         &api_key,
                         idioma_titulo,
                     ) {
@@ -406,6 +416,7 @@ impl AppRenombrador {
                             id,
                             ruta_original: path.clone(),
                             titulo_extraido: titulo_extraido.clone(),
+                            anio_extraido,
                             episodio_info: None,
                             es_serie: false,
                             extension: ext.clone(),
@@ -419,7 +430,8 @@ impl AppRenombrador {
                     }
 
                     let mejor = &candidatos[0];
-                    if mejor.score >= UMBRAL_AUTO {
+                    // La variante desesperada nunca auto-renombra por score.
+                    if mejor.score >= UMBRAL_AUTO && mejor.fiable {
                         let titulo_limpio = limpiar_nombre_archivo(&mejor.titulo);
                         let nuevo_nombre =
                             format!("{} [{}].{}", titulo_limpio, mejor.anio, ext);
@@ -462,6 +474,7 @@ impl AppRenombrador {
                             id,
                             ruta_original: path.clone(),
                             titulo_extraido: titulo_extraido.clone(),
+                            anio_extraido,
                             episodio_info: None,
                             es_serie: false,
                             extension: ext.clone(),
@@ -550,7 +563,10 @@ impl AppRenombrador {
             // Caché (capa 4)
             if recordar && pendiente.es_serie && candidato.media_type == "tv" {
                 if let Ok(mut cache) = cache_arc.lock() {
-                    cache.insert(clave_cache(&pendiente.titulo_extraido), candidato.id);
+                    cache.insert(
+                        clave_cache_titulo(&pendiente.titulo_extraido, pendiente.anio_extraido),
+                        candidato.id,
+                    );
                 }
             }
 
@@ -561,10 +577,14 @@ impl AppRenombrador {
                     lista.remove(idx);
                 }
                 if propagar_a_lote && pendiente.es_serie && candidato.media_type == "tv" {
-                    let clave = clave_cache(&pendiente.titulo_extraido);
+                    let clave =
+                        clave_cache_titulo(&pendiente.titulo_extraido, pendiente.anio_extraido);
                     lista
                         .iter()
-                        .filter(|p| p.es_serie && clave_cache(&p.titulo_extraido) == clave)
+                        .filter(|p| {
+                            p.es_serie
+                                && clave_cache_titulo(&p.titulo_extraido, p.anio_extraido) == clave
+                        })
                         .map(ClonPendiente::from)
                         .collect::<Vec<_>>()
                 } else {
@@ -631,10 +651,11 @@ impl AppRenombrador {
             let client = Client::new();
             // En la búsqueda manual un error de red se muestra como 0
             // resultados; el usuario puede pulsar "Buscar" de nuevo.
+            // Query libre del usuario: sin filtro de año.
             let candidatos = if es_serie {
-                buscar_candidatos_serie(&client, &query, &api_key, idioma)
+                buscar_candidatos_serie(&client, &query, None, &api_key, idioma)
             } else {
-                buscar_candidatos_pelicula(&client, &query, &api_key, idioma)
+                buscar_candidatos_pelicula(&client, &query, None, &api_key, idioma)
             }
             .unwrap_or_default();
             if let Ok(mut lista) = pendientes_arc.lock() {
@@ -670,6 +691,7 @@ struct ClonPendiente {
     id: u64,
     ruta_original: PathBuf,
     titulo_extraido: String,
+    anio_extraido: Option<u32>,
     episodio_info: Option<EpisodioInfo>,
     es_serie: bool,
     extension: String,
@@ -682,6 +704,7 @@ impl From<&Pendiente> for ClonPendiente {
             id: p.id,
             ruta_original: p.ruta_original.clone(),
             titulo_extraido: p.titulo_extraido.clone(),
+            anio_extraido: p.anio_extraido,
             episodio_info: p.episodio_info,
             es_serie: p.es_serie,
             extension: p.extension.clone(),

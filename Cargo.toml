@@ -1,6 +1,6 @@
 [package]
 name = "renombrador"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Renombrador de series y películas usando TMDb (app de escritorio + servicio Docker)"
 # Desactivamos el autodescubrimiento de binarios para declararlos explícitamente
@@ -58,6 +58,7 @@ serde = { version = "1.0", features = ["derive"] }                 # Serializar 
 serde_json = "1.0"                                                 # Respuestas de TMDb y caché
 regex = "1.10.4"                                                   # Parseo de nombres de archivo
 strsim = "0.11"                                                    # Jaro-Winkler para puntuar similitud
+unicode-normalization = "0.1"                                      # NFC: TMDb no encuentra queries NFD (nombres de archivo de macOS)
 walkdir = "2"                                                      # Recorrido recursivo de la carpeta de descargas
 
 # --- Solo GUI (opcionales, feature `gui`) ---
