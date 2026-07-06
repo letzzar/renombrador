@@ -1,0 +1,103 @@
+name: Publicar app macOS
+
+# Compila la GUI para macOS (universal Intel + Apple Silicon), la empaqueta
+# como .app y .dmg con layout, y sube ambos como assets de un GitHub Release
+# (descargables públicamente).
+#
+# Se dispara al hacer push de un tag `vX.Y.Z` (p. ej. `git tag v0.1.0 &&
+# git push origin v0.1.0`) o manualmente desde la pestaña Actions.
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # necesario para crear el Release y subir assets
+
+jobs:
+  build-macos:
+    runs-on: macos-14   # Apple Silicon; compila ambas arquitecturas por target
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar targets Rust
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Cache de cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compilar universal (arm64 + x86_64)
+        run: |
+          cargo build --release --features gui --bin renombrador-gui \
+            --target aarch64-apple-darwin --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/renombrador-gui \
+            target/aarch64-apple-darwin/release/renombrador-gui \
+            target/x86_64-apple-darwin/release/renombrador-gui
+          lipo -info dist/renombrador-gui
+
+      - name: Empaquetar .app
+        run: |
+          cargo install cargo-bundle --locked
+          cargo bundle --release --features gui --bin renombrador-gui
+          APP="target/release/bundle/osx/Renombrador.app"
+          # Sustituir el binario del bundle por el universal.
+          cp dist/renombrador-gui "$APP/Contents/MacOS/renombrador-gui"
+          lipo -info "$APP/Contents/MacOS/renombrador-gui"
+          # Firma ad-hoc (sin cuenta de Apple Developer). Limpiar xattrs antes.
+          xattr -cr "$APP"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose "$APP"
+
+      - name: Generar fondo del DMG
+        run: |
+          mkdir -p dist/bg
+          swift packaging/macos/make_bg.swift dist/bg
+
+      - name: Crear .dmg con layout
+        run: |
+          brew install create-dmg
+          APP="target/release/bundle/osx/Renombrador.app"
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -z "$VERSION" ] && VERSION="dev"
+          DMG="dist/Renombrador-${VERSION}-universal.dmg"
+          # create-dmg envuelve el AppleScript de Finder con reintentos (robusto en CI).
+          create-dmg \
+            --volname "Renombrador" \
+            --background dist/bg/background.png \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 112 \
+            --icon "Renombrador.app" 150 205 \
+            --app-drop-link 450 205 \
+            --hide-extension "Renombrador.app" \
+            "$DMG" \
+            "$APP" \
+            || create-dmg --volname "Renombrador" "$DMG" "$APP"  # fallback sin estilo
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+      - name: Comprimir .app (zip)
+        run: |
+          APP="target/release/bundle/osx/Renombrador.app"
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -z "$VERSION" ] && VERSION="dev"
+          ditto -c -k --keepParent "$APP" "dist/Renombrador-${VERSION}-universal.app.zip"
+
+      - name: Subir artefactos al workflow (siempre)
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build
+          path: |
+            dist/*.dmg
+            dist/*.app.zip
+            dist/renombrador-gui
+
+      - name: Publicar en el Release (solo en tags)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.dmg
+            dist/*.app.zip
