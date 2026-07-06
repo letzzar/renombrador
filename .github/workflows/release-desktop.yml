@@ -1,11 +1,12 @@
-name: Publicar app macOS
+name: Publicar apps de escritorio
 
-# Compila la GUI para macOS (universal Intel + Apple Silicon), la empaqueta
-# como .app y .dmg con layout, y sube ambos como assets de un GitHub Release
-# (descargables públicamente).
+# Compila la GUI para macOS (universal Intel + Apple Silicon) y Windows (x64),
+# las empaqueta y sube como assets de un GitHub Release (descargables
+# públicamente). El servicio Docker/Linux se publica por separado en
+# docker-publish.yml, que también se dispara con estos tags.
 #
-# Se dispara al hacer push de un tag `vX.Y.Z` (p. ej. `git tag v0.1.0 &&
-# git push origin v0.1.0`) o manualmente desde la pestaña Actions.
+# Se dispara al hacer push de un tag `vX.Y.Z` (p. ej. `git tag v1.0.0 &&
+# git push origin v1.0.0`) o manualmente desde la pestaña Actions.
 
 on:
   push:
@@ -16,6 +17,7 @@ permissions:
   contents: write   # necesario para crear el Release y subir assets
 
 jobs:
+  # ---------------------------------------------------------------- macOS ----
   build-macos:
     runs-on: macos-14   # Apple Silicon; compila ambas arquitecturas por target
     steps:
@@ -76,7 +78,6 @@ jobs:
             "$DMG" \
             "$APP" \
             || create-dmg --volname "Renombrador" "$DMG" "$APP"  # fallback sin estilo
-          echo "DMG=$DMG" >> "$GITHUB_ENV"
 
       - name: Comprimir .app (zip)
         run: |
@@ -85,19 +86,54 @@ jobs:
           [ -z "$VERSION" ] && VERSION="dev"
           ditto -c -k --keepParent "$APP" "dist/Renombrador-${VERSION}-universal.app.zip"
 
-      - name: Subir artefactos al workflow (siempre)
+      - name: Subir artefactos macOS al workflow
         uses: actions/upload-artifact@v4
         with:
           name: macos-build
           path: |
             dist/*.dmg
             dist/*.app.zip
-            dist/renombrador-gui
 
-      - name: Publicar en el Release (solo en tags)
+      - name: Publicar macOS en el Release (solo tags)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.dmg
             dist/*.app.zip
+
+  # -------------------------------------------------------------- Windows ----
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache de cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compilar GUI (x64)
+        run: cargo build --release --features gui --bin renombrador-gui
+
+      - name: Empaquetar .zip
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME" -replace '^v',''
+          if (-not $version) { $version = "dev" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          # Nombre amigable del ejecutable dentro del zip.
+          Copy-Item target/release/renombrador-gui.exe dist/Renombrador.exe
+          Compress-Archive -Path dist/Renombrador.exe `
+            -DestinationPath "dist/Renombrador-$version-windows-x64.zip" -Force
+
+      - name: Subir artefacto Windows al workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: dist/*.zip
+
+      - name: Publicar Windows en el Release (solo tags)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
