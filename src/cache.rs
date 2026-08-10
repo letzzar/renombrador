@@ -93,8 +93,15 @@ impl SeriesCache {
         if let Some(padre) = self.path.parent() {
             let _ = fs::create_dir_all(padre);
         }
+        // Escritura atómica: a un temporal y luego rename. `fs::write` directo
+        // trunca el archivo antes de escribir, así que un corte de luz a mitad
+        // dejaba un cache.json truncado que al arrancar no parsea y se descarta
+        // entero, perdiendo todas las series ya resueltas.
         if let Ok(json) = serde_json::to_string_pretty(&self.map) {
-            let _ = fs::write(&self.path, json);
+            let tmp = self.path.with_extension("json.tmp");
+            if fs::write(&tmp, json).is_ok() && fs::rename(&tmp, &self.path).is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
         }
     }
 }

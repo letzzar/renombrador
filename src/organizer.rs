@@ -5,7 +5,10 @@
 use crate::cache::SeriesCache;
 use crate::config::Idioma;
 use crate::mover::mover_seguro;
-use crate::parse::{clave_cache_titulo, extraer_info_archivo, limpiar_nombre_archivo, EpisodioInfo};
+use crate::parse::{
+    clave_cache_titulo, cobertura_palabras, extraer_info_archivo, limpiar_nombre_archivo,
+    EpisodioInfo,
+};
 use crate::tmdb::{
     buscar_candidatos_pelicula, buscar_candidatos_serie, buscar_coleccion_pelicula,
     buscar_nombre_serie, buscar_temporada, Candidato, ErrorTmdb,
@@ -88,6 +91,44 @@ fn motivo_empate(candidatos: &[Candidato]) -> String {
     format!("match ambiguo (score {:.2}) entre: {}", tope, lista.join(" · "))
 }
 
+/// Cobertura mínima de palabras para dar por buena una entrada de caché.
+/// Los datos reales dejan un margen amplio: las entradas podridas medidas
+/// quedaron en 0.33-0.40 y las correctas en 1.00.
+const COBERTURA_MINIMA_CACHE: f64 = 0.6;
+
+/// Margen de años tolerado entre el nombre del archivo y la serie cacheada.
+/// TMDb fecha por primera emisión, que puede diferir un año del que trae el
+/// archivo según el país; más de eso ya es otra serie.
+const MARGEN_ANIOS_CACHE: u32 = 1;
+
+/// ¿La serie a la que apunta un id cacheado se corresponde de verdad con lo
+/// que dice el nombre del archivo?
+///
+/// Una entrada de caché errónea es permanente y **anula cualquier mejora
+/// posterior del parser**: se consulta antes de buscar, así que el archivo se
+/// renombra mal para siempre sin volver a preguntar a TMDb. Pasó de verdad:
+/// `cache.json` traía `"star trek strange new worlds 2022" -> 253` (Star Trek,
+/// 1966), escrito por una versión antigua, y sobrevivió a los arreglos del
+/// parser porque nadie revalidaba el acierto.
+///
+/// Se comprueban dos señales independientes; con que falle una, se desconfía:
+/// - **Año**: decisivo cuando se conoce por ambos lados (2022 contra 1966).
+/// - **Cobertura de palabras**: caza los casos sin año, como
+///   `"special ops lioness"` apuntando a *Special A* (2008).
+fn cache_es_de_fiar(
+    titulo_archivo: &str,
+    anio_archivo: Option<u32>,
+    nombre_serie: &str,
+    anio_serie: &str,
+) -> bool {
+    if let (Some(a), Ok(b)) = (anio_archivo, anio_serie.parse::<u32>()) {
+        if b != 0 && a.abs_diff(b) > MARGEN_ANIOS_CACHE {
+            return false;
+        }
+    }
+    cobertura_palabras(titulo_archivo, nombre_serie) >= COBERTURA_MINIMA_CACHE
+}
+
 /// Formatea `Título` + año según la preferencia: `Título (2021)` o `Título [2021]`.
 fn titulo_con_anio(titulo: &str, anio: &str, corchetes: bool) -> String {
     if corchetes {
@@ -157,19 +198,38 @@ pub fn procesar_archivo(
             None => return Resultado::NoEsSerieConEpisodio,
         };
 
-        // Capa 4: si la serie ya está cacheada, saltamos la búsqueda.
+        // Capa 4: si la serie ya está cacheada, saltamos la búsqueda. Pero
+        // antes comprobamos que el id cacheado siga cuadrando con el nombre del
+        // archivo: una entrada mala escrita por una versión antigua no se
+        // corrige sola, y al consultarse antes de buscar deja inservible
+        // cualquier mejora del parser. Ver `cache_es_de_fiar`.
         let clave = clave_cache_titulo(&titulo, anio_archivo);
         if let Some(series_id) = cache.get(&clave) {
-            match construir_y_mover_serie(client, opts, cache, series_id, ep, path, &ext) {
-                Ok(destino) => {
-                    return Resultado::Renombrado {
-                        destino,
-                        score: 1.0,
-                        desde_cache: true,
+            match obtener_info_serie(client, opts, cache, series_id) {
+                Ok((nombre_serie, anio_serie)) => {
+                    if cache_es_de_fiar(&titulo, anio_archivo, &nombre_serie, &anio_serie) {
+                        match construir_y_mover_serie(
+                            client, opts, cache, series_id, ep, path, &ext,
+                        ) {
+                            Ok(destino) => {
+                                return Resultado::Renombrado {
+                                    destino,
+                                    score: 1.0,
+                                    desde_cache: true,
+                                }
+                            }
+                            Err(Fallo::SerieNoExiste) => cache.eliminar(&clave),
+                            Err(Fallo::Red(e)) => return Resultado::ErrorRed(e),
+                            Err(Fallo::Definitivo(e)) => return Resultado::Error(e),
+                        }
+                    } else {
+                        // Apunta a otra serie: se tira la entrada y se busca de
+                        // nuevo. La búsqueda, si acierta con confianza, la
+                        // sobrescribe con el id bueno (caché autocurativa).
+                        cache.eliminar(&clave);
                     }
                 }
-                // El id cacheado ya no existe en TMDb: invalidamos la entrada
-                // y seguimos con una búsqueda normal (caché autocurativa).
+                // El id cacheado ya no existe en TMDb: misma cura.
                 Err(Fallo::SerieNoExiste) => cache.eliminar(&clave),
                 Err(Fallo::Red(e)) => return Resultado::ErrorRed(e),
                 Err(Fallo::Definitivo(e)) => return Resultado::Error(e),
@@ -307,6 +367,32 @@ fn codigo_episodio(opts: &Opciones, ep: EpisodioInfo) -> String {
     }
 }
 
+/// Nombre y año de una serie por id. Se memoriza en la caché en memoria para
+/// no repetir la llamada con cada episodio del mismo lote, así que consultarla
+/// antes de mover (para validar el acierto) no cuesta ninguna petición extra.
+fn obtener_info_serie(
+    client: &Client,
+    opts: &Opciones,
+    cache: &mut SeriesCache,
+    series_id: i64,
+) -> Result<(String, String), Fallo> {
+    if let Some(info) = cache.serie_info(series_id) {
+        return Ok(info.clone());
+    }
+    let info = match buscar_nombre_serie(client, &opts.api_key, opts.idioma, series_id) {
+        Ok(v) => v,
+        Err(ErrorTmdb::NoEncontrado) => return Err(Fallo::SerieNoExiste),
+        Err(e @ ErrorTmdb::Red(_)) => {
+            return Err(Fallo::Red(format!(
+                "no se pudo obtener info de la serie {}: {}",
+                series_id, e
+            )))
+        }
+    };
+    cache.insertar_serie_info(series_id, info.0.clone(), info.1.clone());
+    Ok(info)
+}
+
 fn construir_y_mover_serie(
     client: &Client,
     opts: &Opciones,
@@ -316,25 +402,7 @@ fn construir_y_mover_serie(
     path: &Path,
     ext: &str,
 ) -> Result<String, Fallo> {
-    // Info de la serie: de la caché en memoria si ya se consultó en esta
-    // ejecución (evita repetir la llamada con cada episodio del lote).
-    let (titulo_serie, anio) = match cache.serie_info(series_id) {
-        Some(info) => info.clone(),
-        None => {
-            let info = match buscar_nombre_serie(client, &opts.api_key, opts.idioma, series_id) {
-                Ok(v) => v,
-                Err(ErrorTmdb::NoEncontrado) => return Err(Fallo::SerieNoExiste),
-                Err(e @ ErrorTmdb::Red(_)) => {
-                    return Err(Fallo::Red(format!(
-                        "no se pudo obtener info de la serie {}: {}",
-                        series_id, e
-                    )))
-                }
-            };
-            cache.insertar_serie_info(series_id, info.0.clone(), info.1.clone());
-            info
-        }
-    };
+    let (titulo_serie, anio) = obtener_info_serie(client, opts, cache, series_id)?;
 
     // Nombre del episodio: de la caché de temporada si existe; si no, UNA
     // llamada trae los nombres de toda la temporada y se cachea.
@@ -512,6 +580,73 @@ mod tests {
             cand("Star Trek", "1966", 0.8643, 61.0),
         ];
         assert!(!hay_empate(&cs));
+    }
+
+    #[test]
+    fn el_anio_delata_una_entrada_de_cache_de_otra_serie() {
+        // Caso real: cache.json traía "star trek strange new worlds 2022" -> 253
+        // (Star Trek, 1966), escrito por una version antigua del parser. El
+        // archivo dice 2022 y la serie es del 66: no hay duda posible.
+        assert!(!cache_es_de_fiar(
+            "Star Trek Strange New Worlds",
+            Some(2022),
+            "Star Trek",
+            "1966"
+        ));
+    }
+
+    #[test]
+    fn la_cobertura_delata_una_entrada_podrida_sin_anio() {
+        // El otro caso real: "special ops lioness" apuntaba a Special A, un
+        // anime de 2008. Sin anio en el nombre del archivo, quien lo caza es la
+        // cobertura de palabras ("ops" y "lioness" no salen en "Special A").
+        assert!(!cache_es_de_fiar("Special Ops Lioness", None, "Special A", "2008"));
+    }
+
+    #[test]
+    fn la_similitud_no_habria_detectado_ninguno_de_los_dos() {
+        // Por que la comprobacion NO usa Jaro-Winkler: las dos entradas
+        // podridas puntuan por encima de una entrada correcta, asi que ningun
+        // umbral de similitud las separa. Este test fija esa medicion para que
+        // nadie "simplifique" la cobertura sustituyendola por similitud.
+        use crate::parse::similitud;
+        let podrido_a = similitud("star trek strange new worlds", "Star Trek", "Star Trek");
+        let podrido_b = similitud("special ops lioness", "Special A", "Special A");
+        let bueno = similitud(
+            "marshals",
+            "Marshals: Una historia de Yellowstone",
+            "Marshals: Una historia de Yellowstone",
+        );
+        assert!(podrido_a > bueno, "{podrido_a} vs {bueno}");
+        assert!(podrido_b > bueno, "{podrido_b} vs {bueno}");
+    }
+
+    #[test]
+    fn una_entrada_correcta_sobrevive_a_la_validacion() {
+        // Ninguna de estas debe tirarse: subtitulo que el archivo no trae,
+        // tildes, y el desfase de un anio que TMDb a veces tiene por pais.
+        assert!(cache_es_de_fiar(
+            "Marshals",
+            None,
+            "Marshals: Una historia de Yellowstone",
+            "2026"
+        ));
+        assert!(cache_es_de_fiar("Teheran", None, "Teherán", "2020"));
+        assert!(cache_es_de_fiar("33 dias", None, "33 días", "2026"));
+        assert!(cache_es_de_fiar(
+            "Star Trek Strange New Worlds",
+            Some(2022),
+            "Star Trek: Strange New Worlds",
+            "2022"
+        ));
+        assert!(cache_es_de_fiar("Silo", Some(2023), "Silo", "2024"));
+    }
+
+    #[test]
+    fn sin_anio_en_el_archivo_no_se_descarta_por_anio() {
+        // El archivo no aporta anio: la comprobacion de anio no debe opinar, y
+        // manda la cobertura, que aqui es total.
+        assert!(cache_es_de_fiar("Ted Lasso", None, "Ted Lasso", "2020"));
     }
 
     #[test]

@@ -294,6 +294,42 @@ pub fn palabras_fuertes(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Pliega diacríticos para comparar palabras sin que la tilde cuente: "días"
+/// y "dias" son la misma palabra. Descompone en NFD y descarta las marcas
+/// combinantes resultantes.
+fn plegar_acentos(s: &str) -> String {
+    s.to_lowercase()
+        .nfd()
+        .filter(|c| !matches!(*c as u32, 0x0300..=0x036F))
+        .collect()
+}
+
+/// Qué proporción de las palabras fuertes de `query` aparece en `nombre`.
+///
+/// Es la señal que distingue un id de caché correcto de uno podrido, y hace el
+/// trabajo que la similitud Jaro-Winkler **no** puede hacer: comparar
+/// `"star trek strange new worlds"` con `"Star Trek"` da 0.86, más que
+/// `"marshals"` contra `"Marshals: Una historia de Yellowstone"` (0.84), porque
+/// premia el prefijo común. Ningún umbral de similitud separa esos dos casos.
+/// La cobertura sí: 0.40 el podrido, 1.00 el bueno.
+///
+/// Se mide solo en un sentido (palabras de la query presentes en el nombre)
+/// porque al nombre de TMDb le sobran subtítulos que el archivo no trae
+/// ("Marshals: Una historia de Yellowstone"); lo sospechoso es lo contrario,
+/// que el archivo nombre cosas que la serie no menciona.
+pub fn cobertura_palabras(query: &str, nombre: &str) -> f64 {
+    let palabras = palabras_fuertes(query);
+    if palabras.is_empty() {
+        return 1.0;
+    }
+    let nombre_plegado = plegar_acentos(nombre);
+    let presentes = palabras
+        .iter()
+        .filter(|p| nombre_plegado.contains(&plegar_acentos(p)))
+        .count();
+    presentes as f64 / palabras.len() as f64
+}
+
 /// Una query candidata contra TMDb, con el idioma en que buscar y si el
 /// resultado puede considerarse fiable para renombrar automáticamente.
 #[derive(Clone, Debug)]
