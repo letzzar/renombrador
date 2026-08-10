@@ -40,6 +40,34 @@ pub struct EpisodioInfo {
 pub fn extraer_info_archivo(
     nombre_archivo: &str,
 ) -> (String, Option<u32>, Option<EpisodioInfo>) {
+    let (sin_corchetes, pos_episodio) = preparar(nombre_archivo);
+    let episodio_info = pos_episodio.map(|(_, _, ep)| ep);
+    let pos_episodio = pos_episodio.map(|(ini, fin, _)| (ini, fin));
+
+    let Segmentos {
+        titulo_prefijo,
+        anio_prefijo,
+        titulo_sufijo,
+        anio_sufijo,
+    } = segmentar(&sin_corchetes, pos_episodio);
+
+    if sufijo_amplia_al_prefijo(&titulo_prefijo, &titulo_sufijo) {
+        // El sufijo es el mismo título, más completo: el prefijo estaba
+        // truncado. El año del prefijo sirve de reserva si el sufijo no trae.
+        (titulo_sufijo, anio_sufijo.or(anio_prefijo), episodio_info)
+    } else {
+        // Se descarta el sufijo entero, año incluido: un "2019" dentro del
+        // título del capítulo no es el año de estreno de la serie.
+        (titulo_prefijo, anio_prefijo, episodio_info)
+    }
+}
+
+/// Deja el nombre listo para trocear: sin extensión, en NFC, sin segmentos
+/// entre corchetes, y localiza el código de episodio.
+///
+/// Devuelve el texto ya saneado y, si hay episodio, `(inicio, fin, info)` de su
+/// código dentro de ese texto.
+fn preparar(nombre_archivo: &str) -> (String, Option<(usize, usize, EpisodioInfo)>) {
     let path = Path::new(nombre_archivo);
     // Normalizar a NFC: los sistemas de archivos de macOS guardan los nombres
     // en NFD ("Á" = "A" + tilde combinante) y la búsqueda de TMDb devuelve 0
@@ -60,26 +88,37 @@ pub fn extraer_info_archivo(
 
     // Detección de episodio con guardia: descartamos temporadas absurdas
     // (p. ej. una resolución "1920x1080" no es la temporada 1920).
-    let (episodio_info, pos_episodio) = match re_episodio_simple
+    let pos = re_episodio_simple
         .captures(&sin_corchetes)
         .and_then(ep_desde_captura)
         .or_else(|| {
             re_episodio_formato
                 .captures(&sin_corchetes)
                 .and_then(ep_desde_captura)
-        }) {
-        Some((ep, ini, fin)) => (Some(ep), Some((ini, fin))),
-        None => (None, None),
-    };
+        })
+        .map(|(ep, ini, fin)| (ini, fin, ep));
 
-    // Los dos lados del código de episodio. El de la derecha suele ser el
-    // título del capítulo (ruido), pero en nombres como
-    // "Star Trek 1x01 Star Trek Strange New Worlds (2022)" es donde vive el
-    // nombre real de la serie: quedarse solo con la izquierda buscaba
-    // "Star Trek" y coincidía al 100 % con la serie de 1966.
+    (sin_corchetes, pos)
+}
+
+/// Los dos lados del código de episodio, ya limpios.
+struct Segmentos {
+    titulo_prefijo: String,
+    anio_prefijo: Option<u32>,
+    titulo_sufijo: String,
+    anio_sufijo: Option<u32>,
+}
+
+/// Parte el nombre por el código de episodio y limpia cada mitad.
+///
+/// El texto de la derecha suele ser el título del capítulo (ruido), pero no
+/// siempre: en `Star Trek 1x01 Star Trek Strange New Worlds (2022)` es donde
+/// vive el nombre real de la serie, y en `Star Trek 1x01 Strange New Worlds
+/// (2022)` es la *segunda mitad* de ese nombre.
+fn segmentar(sin_corchetes: &str, pos_episodio: Option<(usize, usize)>) -> Segmentos {
     let (prefijo, sufijo) = match pos_episodio {
         Some((ini, fin)) => (&sin_corchetes[..ini], &sin_corchetes[fin..]),
-        None => (sin_corchetes.as_str(), ""),
+        None => (sin_corchetes, ""),
     };
 
     // El primer token del prefijo nunca se recorta (hay películas tituladas
@@ -88,15 +127,42 @@ pub fn extraer_info_archivo(
     let (titulo_prefijo, anio_prefijo) = limpiar_segmento(prefijo, false);
     let (titulo_sufijo, anio_sufijo) = limpiar_segmento(sufijo, true);
 
-    if sufijo_amplia_al_prefijo(&titulo_prefijo, &titulo_sufijo) {
-        // El sufijo es el mismo título, más completo: el prefijo estaba
-        // truncado. El año del prefijo sirve de reserva si el sufijo no trae.
-        (titulo_sufijo, anio_sufijo.or(anio_prefijo), episodio_info)
-    } else {
-        // Se descarta el sufijo entero, año incluido: un "2019" dentro del
-        // título del capítulo no es el año de estreno de la serie.
-        (titulo_prefijo, anio_prefijo, episodio_info)
+    Segmentos {
+        titulo_prefijo,
+        anio_prefijo,
+        titulo_sufijo,
+        anio_sufijo,
     }
+}
+
+/// Título formado por las **dos** mitades unidas, para nombres en los que el
+/// código de episodio parte el nombre de la serie por la mitad:
+/// `Star Trek 2x10 Strange New Worlds (2022)` -> `Star Trek Strange New Worlds`.
+///
+/// No se puede decidir desde el nombre si el sufijo completa el título o es el
+/// título del capítulo (`Severance 1x01 Good News About Hell`): las dos formas
+/// son idénticas. Por eso esto no sustituye a `extraer_info_archivo`, solo
+/// ofrece un segundo candidato que la búsqueda prueba **si la primera no
+/// convence**; quien decide es TMDb, no una heurística sobre el nombre.
+///
+/// Devuelve `None` cuando no hay nada que unir: sin sufijo, sin prefijo, o
+/// cuando el sufijo ya amplía al prefijo (ese caso ya lo resuelve
+/// `extraer_info_archivo` por sí solo).
+pub fn titulo_compuesto(nombre_archivo: &str) -> Option<(String, Option<u32>)> {
+    let (sin_corchetes, pos_episodio) = preparar(nombre_archivo);
+    let (ini, fin, _) = pos_episodio?;
+    let seg = segmentar(&sin_corchetes, Some((ini, fin)));
+
+    if seg.titulo_prefijo.is_empty() || seg.titulo_sufijo.is_empty() {
+        return None;
+    }
+    if sufijo_amplia_al_prefijo(&seg.titulo_prefijo, &seg.titulo_sufijo) {
+        return None;
+    }
+    Some((
+        format!("{} {}", seg.titulo_prefijo, seg.titulo_sufijo),
+        seg.anio_sufijo.or(seg.anio_prefijo),
+    ))
 }
 
 /// Normaliza un trozo del nombre de archivo a texto buscable y le extrae el
@@ -603,6 +669,48 @@ mod tests {
         let (t, a, _) = extraer_info_archivo("1x01 Star Trek Strange New Worlds (2022).mkv");
         assert_eq!(t, "Star Trek Strange New Worlds");
         assert_eq!(a, Some(2022));
+    }
+
+    #[test]
+    fn el_codigo_de_episodio_puede_partir_el_titulo_por_la_mitad() {
+        // Caso real: 20 episodios de Strange New Worlds nombrados asi acababan
+        // en `_revisar`, porque el prefijo suelto ("Star Trek") empata con media
+        // docena de series y el sufijo se descartaba entero.
+        let n = "Star Trek 2x10 Strange New Worlds (2022).mkv";
+        // El titulo principal sigue siendo el prefijo: desde el nombre no se
+        // puede saber si el sufijo completa el titulo o nombra el capitulo.
+        let (t, a, _) = extraer_info_archivo(n);
+        assert_eq!(t, "Star Trek");
+        assert_eq!(a, None);
+        // Y el compuesto ofrece la otra lectura, con su anio.
+        assert_eq!(
+            titulo_compuesto(n),
+            Some(("Star Trek Strange New Worlds".to_string(), Some(2022)))
+        );
+    }
+
+    #[test]
+    fn el_compuesto_tambien_se_ofrece_para_un_titulo_de_capitulo() {
+        // No se puede distinguir del caso anterior mirando solo el nombre, asi
+        // que aqui tambien se ofrece; lo descarta la busqueda, no el parser:
+        // "Severance" ya gana por si solo y el plan B ni llega a probarse.
+        assert_eq!(
+            titulo_compuesto("Severance 1x01 Good News About Hell.mkv"),
+            Some(("Severance Good News About Hell".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn no_hay_compuesto_cuando_no_hay_nada_que_unir() {
+        // Sin episodio, sin sufijo, y sufijo de puro ruido (se limpia a vacio).
+        assert_eq!(titulo_compuesto("Dune (2021).mkv"), None);
+        assert_eq!(titulo_compuesto("Los Simpson 12x08.mkv"), None);
+        assert_eq!(titulo_compuesto("Los.Simpson.12x08.WEB-DL.x264.mkv"), None);
+        // El sufijo que amplia al prefijo ya lo resuelve extraer_info_archivo.
+        assert_eq!(
+            titulo_compuesto("Star Trek 1x01 Star Trek Strange New Worlds (2022).mkv"),
+            None
+        );
     }
 
     #[test]

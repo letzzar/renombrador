@@ -7,7 +7,7 @@ use crate::config::Idioma;
 use crate::mover::mover_seguro;
 use crate::parse::{
     clave_cache_titulo, cobertura_palabras, extraer_info_archivo, limpiar_nombre_archivo,
-    EpisodioInfo,
+    titulo_compuesto, EpisodioInfo,
 };
 use crate::tmdb::{
     buscar_candidatos_pelicula, buscar_candidatos_serie, buscar_coleccion_pelicula,
@@ -77,6 +77,15 @@ fn hay_empate(candidatos: &[Candidato]) -> bool {
         .filter(|c| tope - c.score <= EMPATE)
         .count()
         > 1
+}
+
+/// ¿El mejor candidato basta para renombrar sin supervisión? Score por encima
+/// del umbral, de una variante fiable y sin empate.
+fn eleccion_firme(candidatos: &[Candidato], opts: &Opciones) -> bool {
+    match candidatos.first() {
+        Some(mejor) => mejor.score >= opts.umbral && mejor.fiable && !hay_empate(candidatos),
+        None => false,
+    }
 }
 
 /// Descripción legible de un empate, para el log y la carpeta de revisión.
@@ -246,6 +255,35 @@ pub fn procesar_archivo(
             Ok(c) => c,
             Err(e) => return Resultado::ErrorRed(e.to_string()),
         };
+
+        // Plan B: el código de episodio puede partir el nombre de la serie por
+        // la mitad ("Star Trek 2x10 Strange New Worlds (2022)"), y entonces el
+        // prefijo solo es un título genérico que empata con media docena de
+        // series. Se reintenta con las dos mitades unidas. Solo entra cuando la
+        // primera búsqueda no ha convencido, así que no puede estropear ningún
+        // nombre que ya funcione: lo que hoy acaba en `_revisar` es lo único
+        // que cambia de desenlace, y quien decide sigue siendo TMDb.
+        let (candidatos, clave) = match eleccion_firme(&candidatos, opts) {
+            true => (candidatos, clave),
+            false => match titulo_compuesto(&nombre) {
+                Some((titulo2, anio2)) => {
+                    let clave2 = clave_cache_titulo(&titulo2, anio2);
+                    match buscar_candidatos_serie(
+                        client,
+                        &titulo2,
+                        anio2,
+                        &opts.api_key,
+                        opts.idioma,
+                    ) {
+                        Ok(c2) if eleccion_firme(&c2, opts) => (c2, clave2),
+                        Ok(_) => (candidatos, clave),
+                        Err(e) => return Resultado::ErrorRed(e.to_string()),
+                    }
+                }
+                None => (candidatos, clave),
+            },
+        };
+
         if candidatos.is_empty() {
             return manejar_dudoso(opts, path, "sin resultados en TMDb");
         }
@@ -254,7 +292,7 @@ pub fn procesar_archivo(
         // Un candidato de variante desesperada nunca auto-renombra por score.
         // Un empate tampoco: ver `hay_empate`.
         let empate = hay_empate(&candidatos);
-        let confiado = mejor.score >= opts.umbral && mejor.fiable && !empate;
+        let confiado = eleccion_firme(&candidatos, opts);
         if confiado || opts.accion_dudoso == AccionDudoso::Forzar {
             // Solo se memoriza una identificación firme: cachear un empate
             // propagaría el error a todos los episodios del lote y lo dejaría
