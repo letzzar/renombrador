@@ -55,6 +55,39 @@ pub struct Opciones {
     pub dry_run: bool,
 }
 
+/// Margen de similitud dentro del cual dos candidatos se consideran empatados.
+const EMPATE: f64 = 0.02;
+
+/// ¿La elección del mejor candidato la está decidiendo el desempate y no la
+/// similitud?
+///
+/// Un score alto no basta por sí solo. `Star Trek 1x01 …` puntúa **1.00**
+/// contra la serie de 1966 aunque el archivo sea de 2022: ningún umbral lo
+/// atrapa. Cuando varios candidatos quedan a menos de `EMPATE` del mejor, quien
+/// decide de verdad es la popularidad, y eso no basta para renombrar sin
+/// supervisión. El año ya está incorporado al score (bonus/penalización en
+/// `tmdb`), así que un empate que llega hasta aquí es genuinamente indecidible.
+fn hay_empate(candidatos: &[Candidato]) -> bool {
+    let tope = candidatos[0].score;
+    candidatos
+        .iter()
+        .filter(|c| tope - c.score <= EMPATE)
+        .count()
+        > 1
+}
+
+/// Descripción legible de un empate, para el log y la carpeta de revisión.
+fn motivo_empate(candidatos: &[Candidato]) -> String {
+    let tope = candidatos[0].score;
+    let lista: Vec<String> = candidatos
+        .iter()
+        .filter(|c| tope - c.score <= EMPATE)
+        .take(3)
+        .map(|c| format!("{} ({})", c.titulo, c.anio))
+        .collect();
+    format!("match ambiguo (score {:.2}) entre: {}", tope, lista.join(" · "))
+}
+
 /// Formatea `Título` + año según la preferencia: `Título (2021)` o `Título [2021]`.
 fn titulo_con_anio(titulo: &str, anio: &str, corchetes: bool) -> String {
     if corchetes {
@@ -159,8 +192,13 @@ pub fn procesar_archivo(
 
         let mejor = &candidatos[0];
         // Un candidato de variante desesperada nunca auto-renombra por score.
-        let confiado = mejor.score >= opts.umbral && mejor.fiable;
+        // Un empate tampoco: ver `hay_empate`.
+        let empate = hay_empate(&candidatos);
+        let confiado = mejor.score >= opts.umbral && mejor.fiable && !empate;
         if confiado || opts.accion_dudoso == AccionDudoso::Forzar {
+            // Solo se memoriza una identificación firme: cachear un empate
+            // propagaría el error a todos los episodios del lote y lo dejaría
+            // grabado en cache.json.
             if confiado {
                 cache.insertar(clave, mejor.id);
             }
@@ -178,6 +216,8 @@ pub fn procesar_archivo(
                 }
                 Err(Fallo::Definitivo(e)) => Resultado::Error(e),
             }
+        } else if empate {
+            manejar_dudoso(opts, path, &motivo_empate(&candidatos))
         } else {
             manejar_dudoso(opts, path, &format!("match dudoso (score {:.2})", mejor.score))
         }
@@ -198,7 +238,9 @@ pub fn procesar_archivo(
 
         let mejor = &candidatos[0];
         // Un candidato de variante desesperada nunca auto-renombra por score.
-        let confiado = mejor.score >= opts.umbral && mejor.fiable;
+        // Un empate tampoco: ver `hay_empate`.
+        let empate = hay_empate(&candidatos);
+        let confiado = mejor.score >= opts.umbral && mejor.fiable && !empate;
         if confiado || opts.accion_dudoso == AccionDudoso::Forzar {
             let score = mejor.score;
             match construir_y_mover_pelicula(client, opts, mejor, path, &ext) {
@@ -213,6 +255,8 @@ pub fn procesar_archivo(
                 }
                 Err(Fallo::Definitivo(e)) => Resultado::Error(e),
             }
+        } else if empate {
+            manejar_dudoso(opts, path, &motivo_empate(&candidatos))
         } else {
             manejar_dudoso(opts, path, &format!("match dudoso (score {:.2})", mejor.score))
         }
@@ -409,4 +453,75 @@ fn construir_y_mover_pelicula(
     }
     mover_seguro(path, &destino).map_err(Fallo::Definitivo)?;
     Ok(destino.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(titulo: &str, anio: &str, score: f64, pop: f64) -> Candidato {
+        Candidato {
+            id: 1,
+            media_type: "tv".to_string(),
+            titulo: titulo.to_string(),
+            nombre_original: titulo.to_string(),
+            anio: anio.to_string(),
+            popularidad: pop,
+            overview: String::new(),
+            score,
+            fiable: true,
+        }
+    }
+
+    #[test]
+    fn un_ganador_claro_no_empata() {
+        let cs = vec![
+            cand("Severance", "2022", 1.0, 50.0),
+            cand("Severance Otra", "2010", 0.80, 90.0),
+        ];
+        assert!(!hay_empate(&cs));
+    }
+
+    #[test]
+    fn dos_candidatos_igualados_empatan() {
+        // Dos "Dune" con similitud identica: sin anio que los separe, quien
+        // decide es la popularidad, y eso no basta para renombrar solo.
+        let cs = vec![
+            cand("Dune", "2021", 1.0, 90.0),
+            cand("Dune", "1984", 1.0, 30.0),
+        ];
+        assert!(hay_empate(&cs));
+    }
+
+    #[test]
+    fn la_penalizacion_por_anio_deshace_el_empate() {
+        // Con anio en el archivo, `tmdb` ya premia al que coincide y penaliza
+        // al resto; la diferencia resultante supera el margen de empate.
+        let cs = vec![
+            cand("Dune", "1984", 1.05, 30.0),
+            cand("Dune", "2021", 0.85, 90.0),
+        ];
+        assert!(!hay_empate(&cs));
+    }
+
+    #[test]
+    fn diferencia_por_encima_del_margen_no_empata() {
+        // El caso Star Trek ya resuelto por el parser: 0.9931 vs 0.8643.
+        let cs = vec![
+            cand("Star Trek: Strange New Worlds", "2022", 0.9931, 60.0),
+            cand("Star Trek", "1966", 0.8643, 61.0),
+        ];
+        assert!(!hay_empate(&cs));
+    }
+
+    #[test]
+    fn el_motivo_nombra_a_los_empatados() {
+        let cs = vec![
+            cand("Dune", "2021", 1.0, 90.0),
+            cand("Dune", "1984", 1.0, 30.0),
+        ];
+        let m = motivo_empate(&cs);
+        assert!(m.contains("Dune (2021)"), "{m}");
+        assert!(m.contains("Dune (1984)"), "{m}");
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "renombrador"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "Renombrador de series y películas usando TMDb (app de escritorio + servicio Docker)"
 # Desactivamos el autodescubrimiento de binarios para declararlos explícitamente

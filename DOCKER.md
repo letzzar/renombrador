@@ -20,14 +20,22 @@ interaction.
 2. It waits until each file is **stable** (its size hasn't changed for
    `STABLE_SECS`) so it never touches a half-finished download.
 3. It cleans the filename of release tags (resolution, source, codec, group…)
-   and extracts the title (plus season/episode if present).
-4. It searches TMDb for the official title in your language. If it finds a
-   confident match (score ≥ `MATCH_THRESHOLD`):
+   and extracts the title, the release **year** and the season/episode if
+   present. The text *after* the episode code is considered too: in names like
+   `Star Trek 1x01 Star Trek Strange New Worlds (2022)` the real show name
+   lives there, and searching only for `Star Trek` matched the 1966 series
+   perfectly. A normal episode title is still ignored.
+4. It searches TMDb for the official title in your language, passing the year
+   as a filter instead of embedding it in the query. If it finds a confident
+   match — score ≥ `MATCH_THRESHOLD` **and** no near-tie between candidates:
    - **Movie** → `Movies/Title (Year)/Title (Year).mkv`
      (and, if it belongs to a saga, inside `TMDb Collection/…`).
    - **Show** → `Series/Show (Year)/Season 01/Show 1x01 Episode.mkv`.
 5. If it is **not** confident, it applies the `ON_UNCERTAIN` policy (by default,
-   move to `downloads/_revisar` so you can check it by hand).
+   move to `downloads/_revisar` so you can check it by hand). A near-tie counts
+   as not confident even at score 1.00: when several candidates land within
+   0.02 of each other the real decision would be made by popularity, which is
+   not good enough to rename unattended. Only firm matches are cached.
 6. It caches the resolved series id in `/config/cache.json`, so the next
    episodes are renamed instantly without searching again. Episode names are
    fetched **one season at a time** and kept in memory, so a full-season batch
@@ -190,6 +198,7 @@ docker compose down               # stop and remove
 | Everything goes to `_revisar` | Very messy names or wrong language. Lower `MATCH_THRESHOLD` or change `TMDB_LANGUAGE`; the log shows the score. |
 | `TMDb no accesible … reintento N en ~Xs` | Network/TMDb outage (or invalid API key → `HTTP 401`). Files are left in place and retried automatically with backoff. |
 | Wrong show matched | Edit/remove its entry in `/config/cache.json` and restart (stale ids that no longer exist in TMDb are dropped automatically). |
+| `match ambiguo (score …) entre: …` | Several candidates are nearly tied (typical of franchises and remakes). The file goes to `_revisar` on purpose. Rename it adding the year — `Show (2022) 1x01.mkv` — and it resolves on the next pass. |
 | `code: 101` when building | Toolchain too old; the `Dockerfile` uses `rust:1-slim-bookworm` (latest stable). |
 
 ---
@@ -217,14 +226,22 @@ intervención humana.
 2. Espera a que cada archivo esté **estable** (sin cambiar de tamaño durante
    `STABLE_SECS`) para no tocar descargas a medias.
 3. Limpia el nombre de etiquetas de release (resolución, fuente, códec, grupo…)
-   y extrae el título (y temporada/episodio si los hay).
-4. Busca en TMDb el título oficial en tu idioma. Si hay coincidencia fiable
-   (score ≥ `MATCH_THRESHOLD`):
+   y extrae el título, el **año** de estreno y la temporada/episodio si los hay.
+   También mira el texto que va *después* del código de episodio: en nombres
+   como `Star Trek 1x01 Star Trek Strange New Worlds (2022)` el nombre real de
+   la serie está ahí, y buscar solo `Star Trek` coincidía al 100 % con la serie
+   de 1966. Un título de episodio normal se sigue ignorando.
+4. Busca en TMDb el título oficial en tu idioma, pasando el año como filtro en
+   vez de incrustarlo en la query. Si hay coincidencia fiable —score ≥
+   `MATCH_THRESHOLD` **y** sin empate entre candidatos—:
    - **Película** → `Peliculas/Título (Año)/Título (Año).mkv`
      (y si pertenece a una saga, dentro de `Colección de TMDb/…`).
    - **Serie** → `Series/Serie (Año)/Season 01/Serie 1x01 Episodio.mkv`.
 5. Si **no** está seguro, aplica la política de `ON_UNCERTAIN` (por defecto,
-   mover a `descargas/_revisar/` para que lo mires a mano).
+   mover a `descargas/_revisar/` para que lo mires a mano). Un empate cuenta
+   como "no seguro" aunque el score sea 1.00: si varios candidatos quedan a
+   menos de 0.02 entre sí, la decisión real la tomaría la popularidad, y eso no
+   basta para renombrar sin supervisión. Solo se cachean los matches firmes.
 6. Guarda en `/config/cache.json` el `id` de cada serie ya resuelta, para que los
    siguientes episodios se renombren al instante. Los nombres de episodio se
    piden **temporada a temporada** y se guardan en memoria: un lote con una
@@ -388,6 +405,7 @@ docker compose down               # parar y eliminar
 | Todo va a `_revisar` | Nombres muy sucios o idioma equivocado. Baja `MATCH_THRESHOLD` o cambia `TMDB_LANGUAGE`; el log muestra el score. |
 | `TMDb no accesible … reintento N en ~Xs` | Caída de red/TMDb (o API key inválida → `HTTP 401`). Los archivos se dejan en su sitio y se reintentan solos con backoff. |
 | Serie mal identificada | Borra/edita su entrada en `/config/cache.json` y reinicia (los ids obsoletos que ya no existen en TMDb se descartan solos). |
+| `match ambiguo (score …) entre: …` | Varios candidatos casi empatados (típico de franquicias y remakes). El archivo va a `_revisar` a propósito. Renómbralo añadiendo el año — `Serie (2022) 1x01.mkv` — y se resuelve en la siguiente pasada. |
 | `code: 101` al compilar | Toolchain demasiado antiguo; el `Dockerfile` usa `rust:1-slim-bookworm` (último estable). |
 
 ---

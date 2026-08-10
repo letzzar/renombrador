@@ -68,26 +68,53 @@ pub fn extraer_info_archivo(
                 .captures(&sin_corchetes)
                 .and_then(ep_desde_captura)
         }) {
-        Some((ep, pos)) => (Some(ep), Some(pos)),
+        Some((ep, ini, fin)) => (Some(ep), Some((ini, fin))),
         None => (None, None),
     };
 
-    let titulo_antes_episodio = if let Some(pos) = pos_episodio {
-        sin_corchetes[..pos].trim()
-    } else {
-        &sin_corchetes
+    // Los dos lados del código de episodio. El de la derecha suele ser el
+    // título del capítulo (ruido), pero en nombres como
+    // "Star Trek 1x01 Star Trek Strange New Worlds (2022)" es donde vive el
+    // nombre real de la serie: quedarse solo con la izquierda buscaba
+    // "Star Trek" y coincidía al 100 % con la serie de 1966.
+    let (prefijo, sufijo) = match pos_episodio {
+        Some((ini, fin)) => (&sin_corchetes[..ini], &sin_corchetes[fin..]),
+        None => (sin_corchetes.as_str(), ""),
     };
+
+    // El primer token del prefijo nunca se recorta (hay películas tituladas
+    // "Cam" o "Web"); el del sufijo sí, porque un sufijo que arranca con una
+    // etiqueta de release es ruido puro ("Los.Simpson.12x08.WEB-DL").
+    let (titulo_prefijo, anio_prefijo) = limpiar_segmento(prefijo, false);
+    let (titulo_sufijo, anio_sufijo) = limpiar_segmento(sufijo, true);
+
+    if sufijo_amplia_al_prefijo(&titulo_prefijo, &titulo_sufijo) {
+        // El sufijo es el mismo título, más completo: el prefijo estaba
+        // truncado. El año del prefijo sirve de reserva si el sufijo no trae.
+        (titulo_sufijo, anio_sufijo.or(anio_prefijo), episodio_info)
+    } else {
+        // Se descarta el sufijo entero, año incluido: un "2019" dentro del
+        // título del capítulo no es el año de estreno de la serie.
+        (titulo_prefijo, anio_prefijo, episodio_info)
+    }
+}
+
+/// Normaliza un trozo del nombre de archivo a texto buscable y le extrae el
+/// año de estreno. Es la limpieza que antes se aplicaba solo al texto anterior
+/// al código de episodio.
+fn limpiar_segmento(seg: &str, cortar_en_primer_token: bool) -> (String, Option<u32>) {
+    let seg = seg.trim();
 
     // Año entre paréntesis: "(2014)". Es la señal más fiable del año de
     // estreno, así que lo capturamos (el último si hubiera varios) y lo
     // quitamos del título para que la query a TMDb vaya limpia.
     let re_año = regex_estatico!(r"\(\s*([12]\d{3})\s*\)");
     let mut anio: Option<u32> = re_año
-        .captures_iter(titulo_antes_episodio)
+        .captures_iter(seg)
         .last()
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse().ok());
-    let titulo_sin_metadata = re_año.replace_all(titulo_antes_episodio, " ");
+    let titulo_sin_metadata = re_año.replace_all(seg, " ");
 
     // Capa 1: limpieza no destructiva. Sustituimos solo separadores típicos
     // de nombres de release (puntos, guiones bajos, guiones) por espacios y
@@ -98,7 +125,7 @@ pub fn extraer_info_archivo(
 
     // Capa 1b: recortar el título en cuanto aparece una etiqueta de release.
     // Todo lo que va después (calidad, códec, grupo…) es ruido para la búsqueda.
-    let titulo_recortado = recortar_en_tag_release(&titulo_espaciado);
+    let titulo_recortado = recortar_en_tag_release(&titulo_espaciado, cortar_en_primer_token);
 
     // Quitar caracteres prohibidos en nombres de archivo (y barras varias).
     let re_invalidos = regex_estatico!(r#"[<>:"/\\|?*]"#);
@@ -125,17 +152,38 @@ pub fn extraer_info_archivo(
         }
     }
 
-    (limpio, anio, episodio_info)
+    (limpio, anio)
 }
 
-/// Convierte una captura `NxNN` / `SxxExx` en `(EpisodioInfo, posición)`,
+/// ¿El texto posterior al código de episodio es el mismo título del prefijo
+/// pero más completo?
+///
+/// Es la señal que distingue `Star Trek 1x01 Star Trek Strange New Worlds`
+/// (el prefijo venía truncado; manda el sufijo) de
+/// `Severance 1x01 Good News About Hell` (el sufijo es el nombre del capítulo;
+/// manda el prefijo). Se exige frontera de palabra para que "Star" no case con
+/// "Stargate".
+fn sufijo_amplia_al_prefijo(prefijo: &str, sufijo: &str) -> bool {
+    if prefijo.is_empty() {
+        return !sufijo.is_empty();
+    }
+    if sufijo.len() <= prefijo.len() {
+        return false;
+    }
+    let p = prefijo.to_lowercase();
+    let s = sufijo.to_lowercase();
+    s.starts_with(&p) && s[p.len()..].starts_with(' ')
+}
+
+/// Convierte una captura `NxNN` / `SxxExx` en `(EpisodioInfo, inicio, fin)`,
 /// descartando temporadas implausibles (> 50) para no confundir resoluciones
 /// como `1920x1080` con un episodio.
-fn ep_desde_captura(cap: regex::Captures) -> Option<(EpisodioInfo, usize)> {
+fn ep_desde_captura(cap: regex::Captures) -> Option<(EpisodioInfo, usize, usize)> {
     let t = cap.get(1)?.as_str().parse::<u32>().ok()?;
     let e = cap.get(2)?.as_str().parse::<u32>().ok()?;
     if (1..=50).contains(&t) {
-        Some((EpisodioInfo { temporada: t, episodio: e }, cap.get(0).unwrap().start()))
+        let m = cap.get(0).unwrap();
+        Some((EpisodioInfo { temporada: t, episodio: e }, m.start(), m.end()))
     } else {
         None
     }
@@ -198,12 +246,16 @@ fn es_tag_release(token: &str) -> bool {
 }
 
 /// Devuelve el título recortado justo antes de la primera etiqueta de release.
-/// Nunca corta en el primer token (evita dejar el título vacío en pelis como
-/// "Cam" o "Web") ni cuando no hay ninguna etiqueta.
-fn recortar_en_tag_release(s: &str) -> String {
+///
+/// Con `desde_primer_token = false` nunca corta en el token inicial, que es lo
+/// que evita vaciar el título en películas como "Cam" o "Web". Con `true` sí
+/// puede vaciarlo: se usa para el texto posterior al código de episodio, donde
+/// un arranque como "WEB-DL" no es un título sino ruido.
+fn recortar_en_tag_release(s: &str, desde_primer_token: bool) -> String {
     let tokens: Vec<&str> = s.split_whitespace().collect();
+    let inicio = if desde_primer_token { 0 } else { 1 };
     let mut corte = tokens.len();
-    for (i, tok) in tokens.iter().enumerate().skip(1) {
+    for (i, tok) in tokens.iter().enumerate().skip(inicio) {
         if es_tag_release(tok) {
             corte = i;
             break;
@@ -467,6 +519,54 @@ mod tests {
             titulo_y_anio("Cam.2018.1080p.WEBRip.mkv"),
             ("Cam".to_string(), Some(2018))
         );
+    }
+
+    // --- Regresión: el texto tras el código de episodio ya no se descarta ---
+
+    #[test]
+    fn usa_el_sufijo_cuando_amplia_el_titulo_del_prefijo() {
+        // Caso real: el prefijo "Star Trek" coincidía al 100 % con la serie de
+        // 1966 y el nombre verdadero quedaba detrás del "1x01".
+        let (t, a, ep) =
+            extraer_info_archivo("Star Trek 1x01 Star Trek Strange New Worlds (2022).mkv");
+        assert_eq!(t, "Star Trek Strange New Worlds");
+        assert_eq!(a, Some(2022));
+        assert_eq!(ep.unwrap().temporada, 1);
+        assert_eq!(ep.unwrap().episodio, 1);
+    }
+
+    #[test]
+    fn el_sufijo_no_pisa_un_titulo_de_episodio_normal() {
+        // Aquí el sufijo es el nombre del capítulo: no empieza por el prefijo,
+        // así que manda el prefijo, como siempre.
+        let (t, _, _) = extraer_info_archivo("Severance.1x01.Good.News.About.Hell.1080p.WEB.mkv");
+        assert_eq!(t, "Severance");
+
+        let (t2, _, _) = extraer_info_archivo(
+            "Star.Trek.Strange.New.Worlds.1x01.Nuevos.mundos.extraños.(Spanish.English.Subs).WEB-DL.1080p.x264-EAC3.by.Bryan_122.mkv",
+        );
+        assert_eq!(t2, "Star Trek Strange New Worlds");
+    }
+
+    #[test]
+    fn el_anio_del_titulo_del_capitulo_no_se_toma_como_anio_de_la_serie() {
+        // "2019" pertenece al nombre del episodio, que se descarta entero.
+        let (t, a, _) = extraer_info_archivo("Serie.1x01.Un.capitulo.de.2019.WEB-DL.mkv");
+        assert_eq!(t, "Serie");
+        assert_eq!(a, None);
+    }
+
+    #[test]
+    fn sufijo_de_puro_ruido_no_sustituye_al_prefijo() {
+        let (t, _, _) = extraer_info_archivo("Los.Simpson.12x08.WEB-DL.x264.mkv");
+        assert_eq!(t, "Los Simpson");
+    }
+
+    #[test]
+    fn sin_prefijo_se_usa_el_sufijo() {
+        let (t, a, _) = extraer_info_archivo("1x01 Star Trek Strange New Worlds (2022).mkv");
+        assert_eq!(t, "Star Trek Strange New Worlds");
+        assert_eq!(a, Some(2022));
     }
 
     #[test]
