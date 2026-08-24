@@ -600,7 +600,11 @@ fn construir_y_mover_serie(
         Some(n) => format!("{} {} {}", titulo_limpio, codigo, limpiar_nombre_archivo(&n)),
         None => format!("{} {}", titulo_limpio, codigo),
     };
-    let archivo = format!("{}.{}", base, ext);
+    // Un título de episodio que acaba en punto ("Hagas lo que hagas, no
+    // vuelvas a casa.") pegaba el punto de la extensión y salía un
+    // "...casa..mkv". Además, un nombre terminado en punto o espacio es
+    // inválido en Windows/SMB, que es por donde se ve la biblioteca.
+    let archivo = format!("{}.{}", base.trim_end_matches(['.', ' ']), ext);
 
     let destino = if opts.anidado {
         let carpeta_serie = if anio != "0000" {
