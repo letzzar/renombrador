@@ -6,12 +6,12 @@ use crate::cache::SeriesCache;
 use crate::config::Idioma;
 use crate::mover::mover_seguro;
 use crate::parse::{
-    clave_cache_titulo, cobertura_palabras, extraer_info_archivo, limpiar_nombre_archivo,
-    titulo_compuesto, EpisodioInfo,
+    anio_del_sufijo, clave_cache_titulo, cobertura_palabras, extraer_info_archivo,
+    limpiar_nombre_archivo, titulo_compuesto, EpisodioInfo,
 };
 use crate::tmdb::{
     buscar_candidatos_pelicula, buscar_candidatos_serie, buscar_coleccion_pelicula,
-    buscar_nombre_serie, buscar_temporada, Candidato, ErrorTmdb,
+    buscar_nombre_serie, buscar_numeros_episodios, buscar_temporada, Candidato, ErrorTmdb,
 };
 use reqwest::blocking::Client;
 use std::collections::HashMap;
@@ -71,12 +71,90 @@ const EMPATE: f64 = 0.02;
 /// supervisión. El año ya está incorporado al score (bonus/penalización en
 /// `tmdb`), así que un empate que llega hasta aquí es genuinamente indecidible.
 fn hay_empate(candidatos: &[Candidato]) -> bool {
+    empatados(candidatos).len() > 1
+}
+
+/// Índices de los candidatos que quedan a menos de `EMPATE` del mejor (el
+/// propio mejor incluido). La lista viene ordenada por score descendente, así
+/// que el primero siempre está dentro.
+fn empatados(candidatos: &[Candidato]) -> Vec<usize> {
     let tope = candidatos[0].score;
     candidatos
         .iter()
-        .filter(|c| tope - c.score <= EMPATE)
-        .count()
-        > 1
+        .enumerate()
+        .filter(|(_, c)| tope - c.score <= EMPATE)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Rompe un empate preguntando a TMDb cuál de las series empatadas tiene de
+/// verdad el episodio que trae el archivo.
+///
+/// Un empate por similitud no siempre es indecidible: `Silo 3x08` empata 1.00
+/// entre *Silo* (2023) y *Silo* (2017), pero la segunda tiene una única
+/// temporada de 4 capítulos. El nombre del archivo trae un dato que la
+/// búsqueda por título no usa —temporada y episodio— y ese dato lo decide sin
+/// heurísticas: manda TMDb, no la popularidad.
+///
+/// `tiene_episodio` se inyecta para poder probar la decisión sin red. Solo se
+/// devuelve un ganador si sobrevive **exactamente uno**; dos supervivientes
+/// siguen siendo un empate genuino y el archivo se va a revisión como antes.
+///
+/// Un candidato no fiable (variante de búsqueda "desesperada") nunca gana,
+/// pero sí puede impedir que gane otro: si también tiene el episodio, la duda
+/// es real.
+fn desempatar_por_episodio<F>(
+    candidatos: &[Candidato],
+    umbral: f64,
+    mut tiene_episodio: F,
+) -> Result<Option<Candidato>, String>
+where
+    F: FnMut(i64) -> Result<bool, String>,
+{
+    let empatados = empatados(candidatos);
+    if empatados.len() < 2 {
+        return Ok(None);
+    }
+    // Desempatar algo que ni resuelto llegaría al umbral no sirve de nada y
+    // gastaría llamadas a TMDb: el archivo acabaría en revisión igualmente.
+    if candidatos[0].score < umbral {
+        return Ok(None);
+    }
+
+    let mut superviviente: Option<&Candidato> = None;
+    for i in empatados {
+        if !tiene_episodio(candidatos[i].id)? {
+            continue;
+        }
+        if superviviente.is_some() {
+            // Dos series empatadas tienen ese episodio: sigue sin decidirse.
+            return Ok(None);
+        }
+        superviviente = Some(&candidatos[i]);
+    }
+
+    match superviviente {
+        Some(c) if c.fiable => Ok(Some(c.clone())),
+        _ => Ok(None),
+    }
+}
+
+/// ¿Existe en TMDb el episodio `ep` dentro de esta serie? Un 404 de la
+/// temporada es una respuesta válida (no la tiene), no un fallo.
+fn serie_tiene_episodio(
+    client: &Client,
+    opts: &Opciones,
+    series_id: i64,
+    ep: EpisodioInfo,
+) -> Result<bool, String> {
+    match buscar_numeros_episodios(client, &opts.api_key, opts.idioma, series_id, ep.temporada) {
+        Ok(numeros) => Ok(numeros.contains(&ep.episodio)),
+        Err(ErrorTmdb::NoEncontrado) => Ok(false),
+        Err(e @ ErrorTmdb::Red(_)) => Err(format!(
+            "no se pudo comprobar el episodio {}x{:02} de la serie {}: {}",
+            ep.temporada, ep.episodio, series_id, e
+        )),
+    }
 }
 
 /// ¿El mejor candidato basta para renombrar sin supervisión? Score por encima
@@ -284,9 +362,52 @@ pub fn procesar_archivo(
             },
         };
 
+        // Plan C: exprimir el año que vive DETRÁS del código de episodio, que
+        // `extraer_info_archivo` descarta por si es el año de emisión del
+        // capítulo. En `Silo 3x07 Radio (2023)` es el año de la serie, y es lo
+        // único que separa a las dos series llamadas "Silo" (2023 y 2017), que
+        // empatan a 1.00 de similitud. Con el año, `tmdb` premia a una y
+        // penaliza a la otra, y el empate desaparece.
+        //
+        // La clave de caché NO se toca: se memoriza bajo el título sin año
+        // ("silo"), que es la clave que generan los demás episodios del lote
+        // aunque no traigan año en el nombre. Así el reintento se paga una vez.
+        let candidatos = match eleccion_firme(&candidatos, opts) {
+            true => candidatos,
+            false => match anio_del_sufijo(&nombre) {
+                Some(anio) => match buscar_candidatos_serie(
+                    client,
+                    &titulo,
+                    Some(anio),
+                    &opts.api_key,
+                    opts.idioma,
+                ) {
+                    Ok(c2) if eleccion_firme(&c2, opts) => c2,
+                    Ok(_) => candidatos,
+                    Err(e) => return Resultado::ErrorRed(e.to_string()),
+                },
+                None => candidatos,
+            },
+        };
+
         if candidatos.is_empty() {
             return manejar_dudoso(opts, path, "sin resultados en TMDb");
         }
+
+        // Plan D: si sigue habiendo empate, que lo rompa el propio episodio.
+        // Es el último dato del nombre que nadie ha usado todavía y el más
+        // difícil de falsear: una serie homónima que no tiene esa temporada
+        // queda descartada sin depender de la popularidad.
+        let candidatos = match eleccion_firme(&candidatos, opts) {
+            true => candidatos,
+            false => match desempatar_por_episodio(&candidatos, opts.umbral, |id| {
+                serie_tiene_episodio(client, opts, id, ep)
+            }) {
+                Ok(Some(ganador)) => vec![ganador],
+                Ok(None) => candidatos,
+                Err(e) => return Resultado::ErrorRed(e),
+            },
+        };
 
         let mejor = &candidatos[0];
         // Un candidato de variante desesperada nunca auto-renombra por score.
@@ -566,8 +687,12 @@ mod tests {
     use super::*;
 
     fn cand(titulo: &str, anio: &str, score: f64, pop: f64) -> Candidato {
+        cand_id(1, titulo, anio, score, pop)
+    }
+
+    fn cand_id(id: i64, titulo: &str, anio: &str, score: f64, pop: f64) -> Candidato {
         Candidato {
-            id: 1,
+            id,
             media_type: "tv".to_string(),
             titulo: titulo.to_string(),
             nombre_original: titulo.to_string(),
@@ -639,6 +764,91 @@ mod tests {
         // anime de 2008. Sin anio en el nombre del archivo, quien lo caza es la
         // cobertura de palabras ("ops" y "lioness" no salen en "Special A").
         assert!(!cache_es_de_fiar("Special Ops Lioness", None, "Special A", "2008"));
+    }
+
+    /// Los dos "Silo" reales de TMDb: la de 2023 (10 capitulos por temporada,
+    /// 3 temporadas) y una de 2017 con una sola temporada de 4.
+    fn los_dos_silo() -> Vec<Candidato> {
+        vec![
+            cand_id(125988, "Silo", "2023", 1.0, 301.05),
+            cand_id(256215, "Silo", "2017", 1.0, 1.15),
+        ]
+    }
+
+    #[test]
+    fn el_episodio_rompe_el_empate_entre_series_homonimas() {
+        // Caso real de `Silo.3x08`: empate a 1.00 que mandaba el archivo a
+        // revision. Solo una de las dos tiene una temporada 3.
+        let cs = los_dos_silo();
+        assert!(hay_empate(&cs));
+        let ganador = desempatar_por_episodio(&cs, 0.85, |id| Ok(id == 125988))
+            .unwrap()
+            .expect("deberia quedar una sola serie con ese episodio");
+        assert_eq!(ganador.id, 125988);
+    }
+
+    #[test]
+    fn si_las_dos_tienen_el_episodio_el_empate_sigue_en_pie() {
+        // Desempatar no es elegir: con dos series que de verdad podrian ser,
+        // el archivo tiene que seguir yendo a revision.
+        let cs = los_dos_silo();
+        assert!(desempatar_por_episodio(&cs, 0.85, |_| Ok(true))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn si_ninguna_tiene_el_episodio_no_se_inventa_un_ganador() {
+        let cs = los_dos_silo();
+        assert!(desempatar_por_episodio(&cs, 0.85, |_| Ok(false))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn un_empate_por_debajo_del_umbral_no_gasta_llamadas() {
+        // Aunque se resolviera, seguiria sin llegar al umbral: ni se pregunta.
+        let cs = vec![
+            cand_id(1, "Otra cosa", "2023", 0.60, 10.0),
+            cand_id(2, "Otra cosa", "2017", 0.60, 1.0),
+        ];
+        let mut preguntas = 0;
+        let r = desempatar_por_episodio(&cs, 0.85, |_| {
+            preguntas += 1;
+            Ok(true)
+        });
+        assert!(r.unwrap().is_none());
+        assert_eq!(preguntas, 0);
+    }
+
+    #[test]
+    fn sin_empate_no_se_desempata_nada() {
+        let cs = vec![
+            cand_id(1, "Severance", "2022", 1.0, 50.0),
+            cand_id(2, "Severance Otra", "2010", 0.80, 90.0),
+        ];
+        assert!(desempatar_por_episodio(&cs, 0.85, |_| Ok(true))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn un_candidato_no_fiable_no_gana_el_desempate() {
+        // Viene de una variante "desesperada" (una palabra suelta): puede
+        // bloquear el desempate, pero nunca renombrar por su cuenta.
+        let mut cs = los_dos_silo();
+        cs[0].fiable = false;
+        assert!(desempatar_por_episodio(&cs, 0.85, |id| Ok(id == 125988))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn un_fallo_de_red_al_desempatar_no_manda_el_archivo_a_revision() {
+        // Sin respuesta de TMDb no se sabe nada: el llamador debe reintentar,
+        // no dar por dudoso lo que quiza no lo es.
+        let cs = los_dos_silo();
+        assert!(desempatar_por_episodio(&cs, 0.85, |_| Err("sin red".to_string())).is_err());
     }
 
     #[test]

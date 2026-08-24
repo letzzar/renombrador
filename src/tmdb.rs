@@ -4,7 +4,7 @@ use crate::config::Idioma;
 use crate::parse::{similitud, variantes_busqueda};
 use reqwest::blocking::Client;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const BASE_URL: &str = "https://api.themoviedb.org/3";
 
@@ -342,6 +342,39 @@ pub fn buscar_temporada(
         }
     }
     Ok(episodios)
+}
+
+/// Números de episodio que TMDb tiene registrados en una temporada.
+///
+/// A diferencia de `buscar_temporada`, aquí NO se filtra por nombre: se usa
+/// para decidir si una serie contiene de verdad el episodio que trae el
+/// archivo, y un capítulo aún sin título traducido existe igual. Descartarlo
+/// por no tener nombre sería descartar a la serie buena.
+///
+/// `NoEncontrado` (404) significa que esa temporada no existe en la serie, que
+/// es precisamente la respuesta que se está buscando.
+pub fn buscar_numeros_episodios(
+    client: &Client,
+    api_key: &str,
+    idioma: Idioma,
+    series_id: i64,
+    temporada: u32,
+) -> Result<HashSet<u32>, ErrorTmdb> {
+    let url = format!("{}/tv/{}/season/{}", BASE_URL, series_id, temporada);
+    let datos = get_json(
+        client,
+        &url,
+        &[("api_key", api_key), ("language", idioma.codigo())],
+    )?;
+    let mut numeros = HashSet::new();
+    if let Some(lista) = datos.get("episodes").and_then(|e| e.as_array()) {
+        for item in lista {
+            if let Some(n) = item.get("episode_number").and_then(|n| n.as_u64()) {
+                numeros.insert(n as u32);
+            }
+        }
+    }
+    Ok(numeros)
 }
 
 /// Devuelve el nombre de un episodio concreto.

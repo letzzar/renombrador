@@ -165,6 +165,37 @@ pub fn titulo_compuesto(nombre_archivo: &str) -> Option<(String, Option<u32>)> {
     ))
 }
 
+/// El año que `extraer_info_archivo` tira a la basura junto con el sufijo,
+/// para poder recuperarlo como **segundo intento** cuando la búsqueda sin él
+/// no ha convencido.
+///
+/// El sufijo se descarta entero por una razón buena: en
+/// `Los Simpson 12x08 Un tranvía llamado Marge (1991)` ese año es el de emisión
+/// del capítulo, no el de estreno de la serie, y meterlo en la búsqueda
+/// penalizaría a la serie correcta. Pero en `Silo 3x07 Radio (2023)` es el año
+/// de la serie, y es justo lo que separa a dos homónimas.
+///
+/// Como desde el nombre no se puede saber cuál de los dos casos es, esto no
+/// cambia lo que devuelve `extraer_info_archivo`: solo ofrece el dato para un
+/// reintento que, si tampoco convence, se descarta sin efecto.
+///
+/// Devuelve `None` cuando el año no aporta nada nuevo: sin episodio, sin año en
+/// el sufijo, cuando el prefijo ya trae el suyo (ese manda) o cuando el sufijo
+/// amplía al prefijo (ahí `extraer_info_archivo` ya devuelve este año).
+pub fn anio_del_sufijo(nombre_archivo: &str) -> Option<u32> {
+    let (sin_corchetes, pos_episodio) = preparar(nombre_archivo);
+    let (ini, fin, _) = pos_episodio?;
+    let seg = segmentar(&sin_corchetes, Some((ini, fin)));
+
+    if seg.anio_prefijo.is_some() {
+        return None;
+    }
+    if sufijo_amplia_al_prefijo(&seg.titulo_prefijo, &seg.titulo_sufijo) {
+        return None;
+    }
+    seg.anio_sufijo
+}
+
 /// Normaliza un trozo del nombre de archivo a texto buscable y le extrae el
 /// año de estreno. Es la limpieza que antes se aplicaba solo al texto anterior
 /// al código de episodio.
@@ -709,6 +740,31 @@ mod tests {
         // El sufijo que amplia al prefijo ya lo resuelve extraer_info_archivo.
         assert_eq!(
             titulo_compuesto("Star Trek 1x01 Star Trek Strange New Worlds (2022).mkv"),
+            None
+        );
+    }
+
+    #[test]
+    fn el_anio_del_sufijo_queda_disponible_para_un_segundo_intento() {
+        // Caso real de `Silo 3x07 Radio (2023)`: el (2023) se descarta con el
+        // sufijo (podria ser el anio de emision del capitulo), pero se guarda
+        // para reintentar la busqueda si el titulo solo no convence.
+        let n = "Silo 3x07 Radio (2023).mkv";
+        assert_eq!(titulo_y_anio(n), ("Silo".to_string(), None));
+        assert_eq!(anio_del_sufijo(n), Some(2023));
+    }
+
+    #[test]
+    fn no_hay_anio_de_sufijo_que_recuperar() {
+        // Sin anio detras del codigo de episodio.
+        assert_eq!(anio_del_sufijo("Silo.3x08.Plaga.gris.WEB-DL.mkv"), None);
+        // Sin episodio: no hay sufijo del que hablar.
+        assert_eq!(anio_del_sufijo("Dune (2021).mkv"), None);
+        // El prefijo ya trae su anio: ese manda y el reintento no aporta.
+        assert_eq!(anio_del_sufijo("Silo (2023) 3x07 Radio (1999).mkv"), None);
+        // El sufijo amplia al prefijo: su anio ya lo devuelve el parser.
+        assert_eq!(
+            anio_del_sufijo("Star Trek 1x01 Star Trek Strange New Worlds (2022).mkv"),
             None
         );
     }
