@@ -7,7 +7,7 @@ use crate::config::Idioma;
 use crate::mover::mover_seguro;
 use crate::parse::{
     anio_del_sufijo, clave_cache_titulo, cobertura_palabras, extraer_info_archivo,
-    limpiar_nombre_archivo, titulo_compuesto, EpisodioInfo,
+    limpiar_nombre_archivo, palabras_fuertes, titulo_compuesto, titulo_episodio, EpisodioInfo,
 };
 use crate::tmdb::{
     buscar_candidatos_pelicula, buscar_candidatos_serie, buscar_coleccion_pelicula,
@@ -96,9 +96,12 @@ fn empatados(candidatos: &[Candidato]) -> Vec<usize> {
 /// búsqueda por título no usa —temporada y episodio— y ese dato lo decide sin
 /// heurísticas: manda TMDb, no la popularidad.
 ///
-/// `tiene_episodio` se inyecta para poder probar la decisión sin red. Solo se
-/// devuelve un ganador si sobrevive **exactamente uno**; dos supervivientes
-/// siguen siendo un empate genuino y el archivo se va a revisión como antes.
+/// `tiene_episodio` se inyecta para poder probar la decisión sin red, y para
+/// que la misma criba sirva a las dos preguntas que sabemos hacerle al
+/// episodio: si existe (plan D) y si se titula como dice el archivo (plan E).
+/// Solo se devuelve un ganador si sobrevive **exactamente uno**; dos
+/// supervivientes siguen siendo un empate genuino y el archivo se va a
+/// revisión como antes.
 ///
 /// Un candidato no fiable (variante de búsqueda "desesperada") nunca gana,
 /// pero sí puede impedir que gane otro: si también tiene el episodio, la duda
@@ -154,6 +157,76 @@ fn serie_tiene_episodio(
             "no se pudo comprobar el episodio {}x{:02} de la serie {}: {}",
             ep.temporada, ep.episodio, series_id, e
         )),
+    }
+}
+
+/// Nombre que TMDb le da al episodio `ep` de una serie, apoyándose en la caché
+/// de temporada en memoria: la primera consulta trae los nombres de la
+/// temporada entera y las de los demás capítulos del lote salen gratis.
+///
+/// `Ok(None)` cuando no hay nombre que dar —la temporada no existe (un 404 es
+/// una respuesta válida, no un fallo) o TMDb no ha titulado ese capítulo—, así
+/// que un `None` **no** significa que el episodio no exista.
+fn nombre_de_episodio(
+    client: &Client,
+    opts: &Opciones,
+    cache: &mut SeriesCache,
+    series_id: i64,
+    ep: EpisodioInfo,
+) -> Result<Option<String>, String> {
+    if let Some(m) = cache.temporada(series_id, ep.temporada) {
+        return Ok(m.get(&ep.episodio).cloned());
+    }
+    match buscar_temporada(
+        client,
+        &opts.api_key,
+        opts.idioma,
+        series_id,
+        ep.temporada,
+    ) {
+        Ok(m) => {
+            let nombre = m.get(&ep.episodio).cloned();
+            cache.insertar_temporada(series_id, ep.temporada, m);
+            Ok(nombre)
+        }
+        // Temporada inexistente en TMDb: seguimos sin nombre de episodio y
+        // cacheamos el vacío para no volver a pedirla.
+        Err(ErrorTmdb::NoEncontrado) => {
+            cache.insertar_temporada(series_id, ep.temporada, HashMap::new());
+            Ok(None)
+        }
+        Err(e @ ErrorTmdb::Red(_)) => Err(format!(
+            "no se pudo obtener la temporada {}: {}",
+            ep.temporada, e
+        )),
+    }
+}
+
+/// Cobertura mínima de palabras para dar por bueno que el título de capítulo
+/// que trae el archivo y el que da TMDb son el mismo.
+///
+/// Se mide con `cobertura_palabras` y no con similitud por el mismo motivo que
+/// en [`cache_es_de_fiar`]: el archivo trae el título recortado o sin tildes y
+/// TMDb lo trae entero, así que lo que importa es cuántas de las palabras del
+/// archivo aparecen en el nombre real, no cuánto se parecen letra a letra.
+const COBERTURA_MINIMA_EPISODIO: f64 = 0.75;
+
+/// ¿El episodio `ep` de esta serie se llama de verdad como dice el archivo?
+///
+/// Un `false` cubre dos casos que aquí dan igual: que la serie no tenga ese
+/// episodio y que lo tenga con otro nombre. En ambos, esta serie no explica el
+/// nombre del archivo.
+fn episodio_se_llama(
+    client: &Client,
+    opts: &Opciones,
+    cache: &mut SeriesCache,
+    series_id: i64,
+    ep: EpisodioInfo,
+    titulo_archivo: &str,
+) -> Result<bool, String> {
+    match nombre_de_episodio(client, opts, cache, series_id, ep)? {
+        Some(n) => Ok(cobertura_palabras(titulo_archivo, &n) >= COBERTURA_MINIMA_EPISODIO),
+        None => Ok(false),
     }
 }
 
@@ -409,6 +482,35 @@ pub fn procesar_archivo(
             },
         };
 
+        // Plan E: cuando las dos homónimas tienen ese episodio, el plan D se
+        // queda sin argumentos y hay que mirar CÓMO se llama el capítulo.
+        // `Lucky 1x06` empata a 1.00 entre `Lucky` (2026) y `Lucky` (2007), y
+        // las dos tienen un 1x06, pero solo la de 2026 lo titula "Vayas donde
+        // vayas, siempre serás tú"; la de 2007 lo deja en "Episodio 6".
+        //
+        // Es el último dato del nombre que quedaba sin usar. Si el sufijo no
+        // era el título del capítulo sino ruido de release, no encaja con
+        // ningún candidato y el desempate se descarta sin efecto, igual que
+        // los planes B y C: esto solo puede rescatar lo que hoy va a
+        // `_revisar`, nunca estropear un nombre que ya funciona.
+        let candidatos = match eleccion_firme(&candidatos, opts) {
+            true => candidatos,
+            // Un sufijo sin palabras fuertes ("de la") daría cobertura 1.00
+            // contra cualquier cosa: no distingue nada y solo gasta llamadas.
+            false => match titulo_episodio(&nombre).filter(|t| !palabras_fuertes(t).is_empty()) {
+                Some(titulo_ep) => {
+                    match desempatar_por_episodio(&candidatos, opts.umbral, |id| {
+                        episodio_se_llama(client, opts, cache, id, ep, &titulo_ep)
+                    }) {
+                        Ok(Some(ganador)) => vec![ganador],
+                        Ok(None) => candidatos,
+                        Err(e) => return Resultado::ErrorRed(e),
+                    }
+                }
+                None => candidatos,
+            },
+        };
+
         let mejor = &candidatos[0];
         // Un candidato de variante desesperada nunca auto-renombra por score.
         // Un empate tampoco: ver `hay_empate`.
@@ -562,37 +664,7 @@ fn construir_y_mover_serie(
     ext: &str,
 ) -> Result<String, Fallo> {
     let (titulo_serie, anio) = obtener_info_serie(client, opts, cache, series_id)?;
-
-    // Nombre del episodio: de la caché de temporada si existe; si no, UNA
-    // llamada trae los nombres de toda la temporada y se cachea.
-    let nombre_ep = match cache.temporada(series_id, ep.temporada) {
-        Some(m) => m.get(&ep.episodio).cloned(),
-        None => match buscar_temporada(
-            client,
-            &opts.api_key,
-            opts.idioma,
-            series_id,
-            ep.temporada,
-        ) {
-            Ok(m) => {
-                let nombre = m.get(&ep.episodio).cloned();
-                cache.insertar_temporada(series_id, ep.temporada, m);
-                nombre
-            }
-            // Temporada inexistente en TMDb: seguimos sin nombre de episodio
-            // y cacheamos el vacío para no volver a pedirla.
-            Err(ErrorTmdb::NoEncontrado) => {
-                cache.insertar_temporada(series_id, ep.temporada, HashMap::new());
-                None
-            }
-            Err(e @ ErrorTmdb::Red(_)) => {
-                return Err(Fallo::Red(format!(
-                    "no se pudo obtener la temporada {}: {}",
-                    ep.temporada, e
-                )))
-            }
-        },
-    };
+    let nombre_ep = nombre_de_episodio(client, opts, cache, series_id, ep).map_err(Fallo::Red)?;
 
     let titulo_limpio = limpiar_nombre_archivo(&titulo_serie);
     let codigo = codigo_episodio(opts, ep);
@@ -807,6 +879,65 @@ mod tests {
         assert!(desempatar_por_episodio(&cs, 0.85, |_| Ok(false))
             .unwrap()
             .is_none());
+    }
+
+    /// Las dos series llamadas exactamente "Lucky": la de 2026, con capitulos
+    /// titulados, y la de 2007, con 41 capitulos en una sola temporada
+    /// llamados "Episodio N".
+    fn los_dos_lucky() -> Vec<Candidato> {
+        vec![
+            cand_id(278624, "Lucky", "2026", 1.0, 74.7),
+            cand_id(58791, "Lucky", "2007", 1.0, 3.6),
+        ]
+    }
+
+    /// Nombres reales que TMDb da al 1x06 de cada una de las dos "Lucky".
+    fn nombre_1x06(id: i64) -> &'static str {
+        match id {
+            278624 => "Vayas donde vayas, siempre serás tú",
+            _ => "Episodio 6",
+        }
+    }
+
+    #[test]
+    fn el_titulo_del_capitulo_rompe_el_empate_que_el_episodio_no_puede() {
+        // Caso real de `Lucky.1x06`: empate a 1.00 y las DOS series tienen un
+        // 1x06, asi que preguntar si el episodio existe no decide nada. Lo que
+        // las separa es como se llama.
+        let cs = los_dos_lucky();
+        let suf = titulo_episodio(
+            "Lucky.1x06.Vayas.donde.vayas,.siempre.serás.tú.WEBRip.1080p.x265-EAC3.mkv",
+        )
+        .expect("el sufijo es el titulo del capitulo");
+
+        assert!(desempatar_por_episodio(&cs, 0.85, |_| Ok(true))
+            .unwrap()
+            .is_none());
+
+        let ganador = desempatar_por_episodio(&cs, 0.85, |id| {
+            Ok(cobertura_palabras(&suf, nombre_1x06(id)) >= COBERTURA_MINIMA_EPISODIO)
+        })
+        .unwrap()
+        .expect("solo una de las dos titula asi su 1x06");
+        assert_eq!(ganador.id, 278624);
+    }
+
+    #[test]
+    fn la_cobertura_separa_el_titulo_de_capitulo_del_generico() {
+        // Fija la medicion con la que se eligio COBERTURA_MINIMA_EPISODIO,
+        // sobre los nombres reales de TMDb: no hay zona gris que afinar, el
+        // correcto cubre entero y el generico de la homonima no cubre nada.
+        // Aguanta las dos deformaciones habituales de un release: perder las
+        // tildes y traer el titulo recortado.
+        let real = nombre_1x06(278624);
+        for suf in [
+            "Vayas donde vayas, siempre serás tú",
+            "Vayas donde vayas siempre seras tu",
+            "Vayas donde vayas",
+        ] {
+            assert_eq!(cobertura_palabras(suf, real), 1.0);
+            assert_eq!(cobertura_palabras(suf, nombre_1x06(58791)), 0.0);
+        }
     }
 
     #[test]

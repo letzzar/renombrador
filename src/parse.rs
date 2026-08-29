@@ -196,6 +196,38 @@ pub fn anio_del_sufijo(nombre_archivo: &str) -> Option<u32> {
     seg.anio_sufijo
 }
 
+/// El texto que sigue al código de episodio, cuando lo más probable es que sea
+/// el **título del capítulo**: `Lucky 1x06 Vayas donde vayas` -> `Vayas donde
+/// vayas`.
+///
+/// Es el último dato del nombre que nadie usaba, y el que decide cuando dos
+/// series homónimas empatan y además tienen las dos ese episodio: `Lucky`
+/// (2026) llama a su 1x06 "Vayas donde vayas, siempre serás tú" y `Lucky`
+/// (2007) lo llama "Episodio 6". Ninguna heurística sobre el nombre separa a
+/// esas dos series; el título del capítulo sí, y lo dice TMDb.
+///
+/// Igual que en [`titulo_compuesto`], desde el nombre no se puede saber si el
+/// sufijo es el título del capítulo o el resto del título de la serie. Por eso
+/// esto es solo un dato para un desempate que, si no encaja con nadie, se
+/// descarta sin efecto.
+///
+/// Devuelve `None` cuando el sufijo no puede ser un título de capítulo: sin
+/// episodio, sin sufijo, o cuando el sufijo amplía al prefijo (ahí es el
+/// nombre de la serie, no el del capítulo).
+pub fn titulo_episodio(nombre_archivo: &str) -> Option<String> {
+    let (sin_corchetes, pos_episodio) = preparar(nombre_archivo);
+    let (ini, fin, _) = pos_episodio?;
+    let seg = segmentar(&sin_corchetes, Some((ini, fin)));
+
+    if seg.titulo_sufijo.is_empty() {
+        return None;
+    }
+    if sufijo_amplia_al_prefijo(&seg.titulo_prefijo, &seg.titulo_sufijo) {
+        return None;
+    }
+    Some(seg.titulo_sufijo)
+}
+
 /// Normaliza un trozo del nombre de archivo a texto buscable y le extrae el
 /// año de estreno. Es la limpieza que antes se aplicaba solo al texto anterior
 /// al código de episodio.
@@ -547,6 +579,44 @@ mod tests {
     fn titulo_y_anio(n: &str) -> (String, Option<u32>) {
         let (t, a, _) = extraer_info_archivo(n);
         (t, a)
+    }
+
+    #[test]
+    fn el_sufijo_da_el_titulo_del_capitulo() {
+        // Caso real de `Lucky 1x07`: el titulo del capitulo es lo unico que
+        // separa a las dos series llamadas "Lucky".
+        assert_eq!(
+            titulo_episodio(
+                "Lucky.1x07.Todo.cosas.buenas.(Spanish.English.Subs).WEBRip.1080p.x265.mkv"
+            )
+            .as_deref(),
+            Some("Todo cosas buenas")
+        );
+    }
+
+    #[test]
+    fn un_sufijo_de_puro_ruido_no_es_titulo_de_capitulo() {
+        // Sin este `None`, el sufijo vacio daria cobertura 1.00 contra
+        // cualquier serie y el desempate "encajaria" con todas.
+        assert_eq!(
+            titulo_episodio("Lucky.1x06.WEB-DL.1080p.DDP5.1.H264-NTb.mkv"),
+            None
+        );
+    }
+
+    #[test]
+    fn el_sufijo_que_completa_el_nombre_de_la_serie_no_es_capitulo() {
+        // Aqui el sufijo es la otra mitad del nombre de la serie; tomarlo por
+        // titulo de capitulo mandaria a buscar un capitulo que no existe.
+        assert_eq!(
+            titulo_episodio("Star Trek 2x10 Star Trek Strange New Worlds (2022).mkv"),
+            None
+        );
+    }
+
+    #[test]
+    fn sin_codigo_de_episodio_no_hay_titulo_de_capitulo() {
+        assert_eq!(titulo_episodio("Dune.2021.1080p.BluRay.x264-GROUP.mkv"), None);
     }
 
     #[test]
