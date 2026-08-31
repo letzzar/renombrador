@@ -1,9 +1,10 @@
 name: Publicar apps de escritorio
 
-# Compila la GUI para macOS (universal Intel + Apple Silicon) y Windows (x64),
-# las empaqueta y sube como assets de un GitHub Release (descargables
-# públicamente). El servicio Docker/Linux se publica por separado en
-# docker-publish.yml, que también se dispara con estos tags.
+# Compila la GUI para macOS (universal Intel + Apple Silicon), Windows (x64) y
+# Linux (x86_64 y aarch64), las empaqueta y sube como assets de un GitHub
+# Release (descargables públicamente). El *servicio* Docker se publica por
+# separado en docker-publish.yml, que también se dispara con estos tags: lo de
+# aquí es la app de escritorio, no el daemon.
 #
 # Se dispara al hacer push de un tag `vX.Y.Z` (p. ej. `git tag v1.0.0 &&
 # git push origin v1.0.0`) o manualmente desde la pestaña Actions.
@@ -137,3 +138,93 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip
+
+  # ---------------------------------------------------------------- Linux ----
+  # Una compilación nativa por arquitectura, no cross-compiling: la GUI enlaza
+  # con GTK, X11 y Wayland del sistema, y montar ese sysroot cruzado da mucha
+  # más guerra que usar el runner ARM, que en repos públicos es gratis.
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Se compila sobre 22.04 (glibc 2.35) a propósito, no sobre la última:
+      # un binario enlazado contra una glibc más nueva no arranca en sistemas
+      # más viejos, y el error que da no dice por qué.
+      - name: Dependencias de la GUI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgtk-3-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
+            libgl1-mesa-dev
+
+      - name: Cache de cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+
+      - name: Compilar GUI
+        run: cargo build --release --features gui --bin renombrador-gui
+
+      - name: Empaquetar .tar.gz
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -z "$VERSION" ] && VERSION="dev"
+          mkdir -p dist/pkg
+          # Nombre amigable dentro del paquete, igual que en Windows.
+          cp target/release/renombrador-gui dist/pkg/Renombrador
+          strip dist/pkg/Renombrador
+          cp LICENSE dist/pkg/
+          # Las bibliotecas van enlazadas dinámicamente: sin esta nota, en un
+          # sistema pelado el binario falla con un error de .so ilegible.
+          cat > dist/pkg/LEEME.txt <<'EOF'
+          Renombrador — app de escritorio para Linux
+
+          Ejecuta ./Renombrador
+
+          Necesita estas bibliotecas del sistema (presentes en cualquier
+          escritorio normal; en una instalación mínima, instálalas):
+
+            Debian/Ubuntu:
+              sudo apt install libgtk-3-0 libxkbcommon0 libwayland-client0 \
+                libxcb1 libx11-6 libxi6 libxcursor1 libxrandr2 libgl1
+
+            Fedora:
+              sudo dnf install gtk3 libxkbcommon libwayland-client libxcb \
+                libX11 libXi libXcursor libXrandr mesa-libGL
+
+          Compilado sobre glibc 2.35 (Ubuntu 22.04): funciona en Debian 12+,
+          Ubuntu 22.04+ y equivalentes.
+
+          El servicio para NAS/servidor no es esto: es la imagen Docker
+          letzzar/renombrador. Ver DOCKER.md.
+          EOF
+          tar -czf "dist/Renombrador-${VERSION}-linux-${{ matrix.arch }}.tar.gz" \
+            -C dist/pkg .
+          ls -l dist/
+
+      - name: Subir artefacto Linux al workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}-build
+          path: dist/*.tar.gz
+
+      - name: Publicar Linux en el Release (solo tags)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
