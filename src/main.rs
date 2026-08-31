@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 
 use renombrador::cache::SeriesCache;
 use renombrador::config::Idioma;
-use renombrador::mover::{borrar_dir_vacio_bajo, crear_dirs, modos_configurados};
+use renombrador::mover::{borrar_dir_vacio_bajo, crear_dirs, descripcion_permisos};
 use renombrador::organizer::{procesar_archivo, AccionDudoso, Opciones, Resultado};
 use renombrador::EXTENSIONES_VALIDAS;
 
@@ -198,11 +198,8 @@ fn banner(env: &Entorno) {
         ),
     );
     log("INFO", format!("  Colecciones:    {}", o.usar_colecciones));
-    if let Some((archivo, dir)) = modos_configurados() {
-        log(
-            "INFO",
-            format!("  Permisos:       archivos {:o} · directorios {:o}", archivo, dir),
-        );
+    if let Some(permisos) = descripcion_permisos() {
+        log("INFO", format!("  Permisos:       {}", permisos));
     }
     log(
         "INFO",

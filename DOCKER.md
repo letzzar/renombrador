@@ -125,8 +125,9 @@ Helper scripts: `./scripts/start.sh`, `./scripts/logs.sh`, `./scripts/stop.sh`.
 | `CLEAN_EMPTY_DIRS` | `false`                | Delete empty subfolders after moving (e.g. torrent folders). |
 | `REVIEW_DIR`       | `/descargas/_revisar`  | Quarantine folder for doubtful matches. |
 | `CACHE_FILE`       | `/config/cache.json`   | Series cache path. |
-| `FILE_MODE`        | `644`                  | Octal permissions applied to every moved file (Linux only). |
-| `DIR_MODE`         | `755`                  | Octal permissions applied to every destination folder *created* by the service; existing ones are left alone (Linux only). |
+| `FILE_MODE`        | *(from destination)*   | Octal override for every moved file. Unset, the file takes the destination folder's mode without the execute/special bits (Linux only). |
+| `DIR_MODE`         | *(from destination)*   | Octal override for every destination folder *created* by the service; existing ones are left alone. Unset, a new folder copies the mode of the level above it (Linux only). |
+| `PUID` / `PGID`    | *(from destination)*   | Numeric owner/group override. Unset, the result takes the destination folder's `uid:gid`. Requires the container to run as root (Linux only). |
 | `TZ`               | `Europe/Madrid`        | Container timezone (for Docker log timestamps). |
 
 ---
@@ -199,7 +200,7 @@ docker compose down               # stop and remove
 | Slow to react | Normal: it waits `STABLE_SECS` + one `POLL_INTERVAL`. Lower them for more reactivity. |
 | Everything goes to `_revisar` | Very messy names or wrong language. Lower `MATCH_THRESHOLD` or change `TMDB_LANGUAGE`; the log shows the score. |
 | `TMDb no accesible … reintento N en ~Xs` | Network/TMDb outage (or invalid API key → `HTTP 401`). Files are left in place and retried automatically with backoff. |
-| Player says `Permission denied` on the moved files | Files land with the permissions they had in the downloads folder. Since v1.2.1 they are normalised to `FILE_MODE` (644); check the `Permisos:` line in the startup log. Files moved by an older version need a one-off `chmod a+r` on the host. |
+| Player says `Permission denied` on the moved files | Files used to land with the permissions they had in the downloads folder (often `000`). Since v1.2.2 every moved file and every folder created for it takes the mode and `uid:gid` of the destination folder it lands in, so the result matches the library around it; check the `Permisos:` line in the startup log. Files moved by an older version need a one-off `chmod a+r` on the host. If the destination folder itself is too closed, fix *it* — that is now the reference. |
 | Wrong show matched | Edit/remove its entry in `/config/cache.json` and restart (stale ids that no longer exist in TMDb are dropped automatically). |
 | `match ambiguo (score …) entre: …` | Several candidates are nearly tied (typical of franchises and remakes). The file goes to `_revisar` on purpose. Rename it adding the year — `Show (2022) 1x01.mkv` — and it resolves on the next pass. |
 | `code: 101` when building | Toolchain too old; the `Dockerfile` uses `rust:1-slim-bookworm` (latest stable). |
@@ -335,8 +336,9 @@ Scripts de ayuda: `./scripts/start.sh`, `./scripts/logs.sh`, `./scripts/stop.sh`
 | `CLEAN_EMPTY_DIRS` | `false`                | Borrar subcarpetas vacías tras mover (p. ej. carpetas de torrent). |
 | `REVIEW_DIR`       | `/descargas/_revisar`  | Carpeta de cuarentena para matches dudosos. |
 | `CACHE_FILE`       | `/config/cache.json`   | Ruta de la caché de series. |
-| `FILE_MODE`        | `644`                  | Permisos (octal) que se aplican a cada archivo movido (solo Linux). |
-| `DIR_MODE`         | `755`                  | Permisos (octal) de las carpetas de destino que *crea* el servicio; las que ya existían no se tocan (solo Linux). |
+| `FILE_MODE`        | *(del destino)*        | Fuerza los permisos (octal) de cada archivo movido. Sin definir, el archivo toma el modo de su carpeta de destino sin los bits de ejecución ni los especiales (solo Linux). |
+| `DIR_MODE`         | *(del destino)*        | Fuerza los permisos (octal) de las carpetas que *crea* el servicio; las que ya existían no se tocan. Sin definir, una carpeta nueva copia el modo del nivel del que cuelga (solo Linux). |
+| `PUID` / `PGID`    | *(del destino)*        | Fuerza el propietario/grupo numérico. Sin definir, el resultado toma el `uid:gid` de la carpeta de destino. Exige que el contenedor corra como root (solo Linux). |
 | `TZ`               | `Europe/Madrid`        | Zona horaria (marcas de tiempo de los logs). |
 
 ---
@@ -409,7 +411,7 @@ docker compose down               # parar y eliminar
 | Tarda en procesar | Normal: espera `STABLE_SECS` + un ciclo de `POLL_INTERVAL`. Bájalos si quieres más reactividad. |
 | Todo va a `_revisar` | Nombres muy sucios o idioma equivocado. Baja `MATCH_THRESHOLD` o cambia `TMDB_LANGUAGE`; el log muestra el score. |
 | `TMDb no accesible … reintento N en ~Xs` | Caída de red/TMDb (o API key inválida → `HTTP 401`). Los archivos se dejan en su sitio y se reintentan solos con backoff. |
-| El reproductor da `Permission denied` con los archivos movidos | Los archivos llegaban con los permisos que traían de la carpeta de descargas. Desde la v1.2.1 se normalizan a `FILE_MODE` (644); comprueba la línea `Permisos:` del log de arranque. Lo movido por versiones anteriores necesita un `chmod a+r` puntual en el host. |
+| El reproductor da `Permission denied` con los archivos movidos | Los archivos llegaban con los permisos que traían de la carpeta de descargas (a menudo `000`). Desde la v1.2.2 cada archivo movido y cada carpeta que se crea para él toman el modo y el `uid:gid` de la carpeta de destino en la que aterrizan, así que el resultado queda igual que la biblioteca que lo rodea; comprueba la línea `Permisos:` del log de arranque. Lo movido por versiones anteriores necesita un `chmod a+r` puntual en el host. Si la carpeta de destino es la que está cerrada, arréglala a ella: ahora es la referencia. |
 | Serie mal identificada | Borra/edita su entrada en `/config/cache.json` y reinicia (los ids obsoletos que ya no existen en TMDb se descartan solos). |
 | `match ambiguo (score …) entre: …` | Varios candidatos casi empatados (típico de franquicias y remakes). El archivo va a `_revisar` a propósito. Renómbralo añadiendo el año — `Serie (2022) 1x01.mkv` — y se resuelve en la siguiente pasada. |
 | `code: 101` al compilar | Toolchain demasiado antiguo; el `Dockerfile` usa `rust:1-slim-bookworm` (último estable). |
