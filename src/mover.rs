@@ -119,6 +119,16 @@ impl Herencia {
     ///   algo muy distinto que en una carpeta.
     /// - `uid`/`gid` salen de esa misma carpeta, para que el archivo quede del
     ///   mismo dueño y grupo que el resto de la biblioteca.
+    ///
+    /// Un nivel **sin ningún bit de lectura** (`000`, `--x--x--x`) no se acepta
+    /// como referencia y se sigue subiendo. No es una carpeta "muy cerrada" de
+    /// la que haya que aprender: en un recurso con ACL —lo normal en un NAS
+    /// Synology, se ve por el `+` de `ls -l`— los permisos de verdad viven en
+    /// la ACL y los bits POSIX se quedan a cero. Copiar ese cero a un archivo
+    /// lo deja ilegible de verdad, que es justo el `000` que veíamos: una
+    /// `_revisar` heredada de una versión antigua envenenaba todo lo que caía
+    /// dentro. Su `uid:gid` tampoco vale (aparecía como `letzzar:root`), así
+    /// que se descarta el nivel entero, no solo el modo.
     #[cfg(unix)]
     pub fn del_destino(destino: &Path) -> Self {
         let (modo_archivo_env, modo_dir_env) = permisos::modos_forzados();
@@ -130,10 +140,13 @@ impl Herencia {
             if r.as_os_str().is_empty() {
                 break None;
             }
-            if let Some(estado) = permisos::estado_de(r) {
-                break Some(estado);
+            match permisos::estado_de(r) {
+                Some(estado) if estado.0 & 0o444 != 0 => break Some(estado),
+                // Existe pero no sirve de referencia: seguir subiendo.
+                Some(_) => referencia = r.parent(),
+                // No existe todavía: es un nivel que vamos a crear nosotros.
+                None => referencia = r.parent(),
             }
-            referencia = r.parent();
         };
 
         let (modo, uid, gid) = match estado {
@@ -516,6 +529,86 @@ mod tests {
         assert_eq!(modo(&raiz), 0o701, "un directorio preexistente no se toca");
         assert_eq!(modo(&raiz.join("Serie (2025)")), 0o701);
         assert_eq!(modo(&hoja), 0o701);
+        let _ = fs::remove_dir_all(&raiz);
+    }
+
+    /// Al crear `_revisar` dentro de descargas, hereda el modo y el `uid:gid`
+    /// de la carpeta que la contiene, no la umask del proceso.
+    #[test]
+    fn crear_revisar_hereda_de_la_carpeta_que_la_contiene() {
+        let raiz = caja("revisar");
+        let descargas = raiz.join("descargas");
+        fs::create_dir_all(&descargas).unwrap();
+        fs::set_permissions(&descargas, fs::Permissions::from_mode(0o777)).unwrap();
+        let esperado = duenio(&descargas);
+
+        let revisar = descargas.join("_revisar");
+        crear_dirs(&revisar).unwrap();
+
+        assert_eq!(modo(&revisar), 0o777, "el modo sale de descargas");
+        assert_eq!(duenio(&revisar), esperado, "y el dueño y el grupo también");
+        let _ = fs::remove_dir_all(&raiz);
+    }
+
+    /// El bug real: una `_revisar` que ya existía en `000` —el aspecto que
+    /// tiene una carpeta con ACL en un NAS Synology— se usaba como referencia
+    /// y dejaba en `000` todo lo que iba a cuarentena. Un nivel sin ningún bit
+    /// de lectura no es referencia válida: se sigue subiendo.
+    #[test]
+    fn una_carpeta_de_destino_en_000_no_envenena_lo_que_cae_dentro() {
+        let raiz = caja("revisar-roto");
+        let descargas = raiz.join("descargas");
+        fs::create_dir_all(&descargas).unwrap();
+        fs::set_permissions(&descargas, fs::Permissions::from_mode(0o775)).unwrap();
+
+        // La `_revisar` heredada de una versión antigua, ilegible.
+        let revisar = descargas.join("_revisar");
+        fs::create_dir_all(&revisar).unwrap();
+        fs::set_permissions(&revisar, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Se comprueba la herencia calculada y no un `mover_seguro` completo
+        // porque el test no corre como root y no podría ni escribir dentro de
+        // una carpeta `000`. El contenedor sí es root: escribe, y por eso el
+        // archivo llegaba a existir con el `000` heredado.
+        let esperado = duenio(&descargas);
+        let h = Herencia::del_destino(&revisar.join("descarga.mkv"));
+
+        assert_eq!(
+            h.modo_archivo,
+            Some(0o664),
+            "hereda de descargas (0o775 & 0o666), no el 000 de _revisar"
+        );
+        assert_eq!(h.modo_dir, Some(0o775));
+        assert_eq!(
+            (h.uid, h.gid),
+            (Some(esperado.0), Some(esperado.1)),
+            "el uid:gid también sale de descargas: el de _revisar tampoco vale"
+        );
+        assert_eq!(
+            modo(&revisar),
+            0o000,
+            "la carpeta preexistente no se toca, solo se ignora como referencia"
+        );
+
+        // Hay que poder volver a entrar para limpiar.
+        fs::set_permissions(&revisar, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&raiz);
+    }
+
+    /// Una carpeta cerrada pero legible por su dueño sigue siendo referencia
+    /// válida: solo se descarta la que no deja leer a nadie.
+    #[test]
+    fn una_carpeta_privada_pero_legible_si_vale_de_referencia() {
+        let raiz = caja("privada");
+        fs::set_permissions(&raiz, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let origen = std::env::temp_dir().join(format!("origen-priv-{}.mkv", std::process::id()));
+        fs::write(&origen, b"video").unwrap();
+
+        let destino = raiz.join("x.mkv");
+        mover_seguro(&origen, &destino).unwrap();
+
+        assert_eq!(modo(&destino), 0o600, "0o700 & 0o666");
         let _ = fs::remove_dir_all(&raiz);
     }
 
