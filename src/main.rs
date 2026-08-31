@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 
 use renombrador::cache::SeriesCache;
 use renombrador::config::Idioma;
-use renombrador::mover::borrar_dir_vacio_bajo;
+use renombrador::mover::{borrar_dir_vacio_bajo, crear_dirs, modos_configurados};
 use renombrador::organizer::{procesar_archivo, AccionDudoso, Opciones, Resultado};
 use renombrador::EXTENSIONES_VALIDAS;
 
@@ -198,6 +198,12 @@ fn banner(env: &Entorno) {
         ),
     );
     log("INFO", format!("  Colecciones:    {}", o.usar_colecciones));
+    if let Some((archivo, dir)) = modos_configurados() {
+        log(
+            "INFO",
+            format!("  Permisos:       archivos {:o} · directorios {:o}", archivo, dir),
+        );
+    }
     log(
         "INFO",
         format!(
@@ -253,7 +259,7 @@ fn main() {
         &env.opts.dir_series,
         &env.opts.dir_revisar,
     ] {
-        if let Err(e) = std::fs::create_dir_all(dir) {
+        if let Err(e) = crear_dirs(dir) {
             log("WARN", format!("no se pudo crear '{}': {}", dir.display(), e));
         }
     }
