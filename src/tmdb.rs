@@ -448,7 +448,7 @@ pub fn buscar_nombres_episodio_traducidos(
 /// Exigir las dos cosas protege los títulos legítimos por los dos lados:
 /// `"Radio"` es una palabra suelta pero no lleva número, y `"La torre negra
 /// (1)"` lleva número pero no es una palabra suelta.
-fn es_nombre_generico(nombre: &str, episodio: u32) -> bool {
+pub fn es_nombre_generico(nombre: &str, episodio: u32) -> bool {
     let palabras = nombre
         .split(|c: char| !c.is_alphabetic())
         .filter(|p| !p.is_empty())

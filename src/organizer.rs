@@ -13,7 +13,7 @@ use crate::parse::{
 use crate::tmdb::{
     buscar_candidatos_pelicula, buscar_candidatos_serie, buscar_coleccion_pelicula,
     buscar_nombre_serie, buscar_nombres_episodio_traducidos, buscar_numeros_episodios,
-    buscar_temporada, Candidato, ErrorTmdb,
+    buscar_temporada, es_nombre_generico, Candidato, ErrorTmdb,
 };
 use reqwest::blocking::Client;
 use std::collections::HashMap;
@@ -742,6 +742,34 @@ fn obtener_info_serie(
     Ok(info)
 }
 
+/// Con qué titular el capítulo dentro del nombre del archivo.
+///
+/// Manda lo que diga TMDb, salvo cuando lo que dice es su relleno genérico
+/// ("Episodio 1"): eso no añade nada que no diga ya el `1x01` y encima disfraza
+/// de título traducido lo que en realidad es una traducción que falta. Ahí vale
+/// más el título que trae el propio archivo, que a menudo es el único sitio
+/// donde ese capítulo existe en español —TMDb no tiene ni una traducción
+/// española de los seis `Dalgliesh`, pero el release las trae todas—.
+///
+/// El sufijo del archivo se criba igual que en los planes E y F: sin palabras
+/// fuertes es ruido de release y no titula nada. Si no hay nada mejor, se
+/// conserva el relleno de TMDb antes que quedarse sin título.
+fn titulo_de_capitulo(
+    nombre_tmdb: Option<String>,
+    path: &Path,
+    ep: EpisodioInfo,
+) -> Option<String> {
+    let del_archivo = || {
+        let nombre = path.file_name()?.to_string_lossy().to_string();
+        titulo_episodio(&nombre).filter(|t| !palabras_fuertes(t).is_empty())
+    };
+    match nombre_tmdb {
+        Some(n) if !es_nombre_generico(&n, ep.episodio) => Some(n),
+        Some(n) => del_archivo().or(Some(n)),
+        None => del_archivo(),
+    }
+}
+
 fn construir_y_mover_serie(
     client: &Client,
     opts: &Opciones,
@@ -756,7 +784,7 @@ fn construir_y_mover_serie(
 
     let titulo_limpio = limpiar_nombre_archivo(&titulo_serie);
     let codigo = codigo_episodio(opts, ep);
-    let base = match nombre_ep {
+    let base = match titulo_de_capitulo(nombre_ep, path, ep) {
         Some(n) => format!("{} {} {}", titulo_limpio, codigo, limpiar_nombre_archivo(&n)),
         None => format!("{} {}", titulo_limpio, codigo),
     };
@@ -1124,6 +1152,56 @@ mod tests {
                 "{archivo} vs {equivocada}: {mala}"
             );
         }
+    }
+
+    /// Nombre real del 1x01 de `Dalgliesh` tal y como lo trae el release.
+    const DALGLIESH_1X01: &str =
+        "Dalgliesh.1x01.Sudario.para.un.ruiseñor.Parte.1.(Spanish.English.Subs).WEBRip.1080p.x264-AC3.by.Mony2007.mkv";
+
+    #[test]
+    fn el_titulo_del_archivo_sustituye_al_relleno_de_tmdb() {
+        // TMDb no tiene ni una traduccion espaniola de los seis `Dalgliesh`, asi
+        // que en es-ES contesta "Episodio 1". El release si trae el titulo, y es
+        // mejor eso que repetir en el nombre lo que ya dice el 1x01.
+        let t = titulo_de_capitulo(
+            Some("Episodio 1".to_string()),
+            Path::new(DALGLIESH_1X01),
+            EpisodioInfo {
+                temporada: 1,
+                episodio: 1,
+            },
+        );
+        assert_eq!(t.as_deref(), Some("Sudario para un ruiseñor Parte 1"));
+    }
+
+    #[test]
+    fn un_titulo_de_tmdb_de_verdad_manda_sobre_el_del_archivo() {
+        // Cuando TMDb tiene el capitulo titulado, la biblioteca se queda con su
+        // version y no con la del grupo de release.
+        let t = titulo_de_capitulo(
+            Some("Sudario para un ruiseñor (1)".to_string()),
+            Path::new(DALGLIESH_1X01),
+            EpisodioInfo {
+                temporada: 1,
+                episodio: 1,
+            },
+        );
+        assert_eq!(t.as_deref(), Some("Sudario para un ruiseñor (1)"));
+    }
+
+    #[test]
+    fn sin_nada_mejor_se_conserva_el_relleno() {
+        // El archivo no aporta titulo (solo tags de release): no se pierde nada
+        // por el camino, se deja lo que dice TMDb.
+        let t = titulo_de_capitulo(
+            Some("Episodio 1".to_string()),
+            Path::new("Dalgliesh.1x01.WEBRip.1080p.x264-AC3.mkv"),
+            EpisodioInfo {
+                temporada: 1,
+                episodio: 1,
+            },
+        );
+        assert_eq!(t.as_deref(), Some("Episodio 1"));
     }
 
     #[test]
