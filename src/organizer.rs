@@ -7,11 +7,13 @@ use crate::config::Idioma;
 use crate::mover::mover_seguro;
 use crate::parse::{
     anio_del_sufijo, clave_cache_titulo, cobertura_palabras, extraer_info_archivo,
-    limpiar_nombre_archivo, palabras_fuertes, titulo_compuesto, titulo_episodio, EpisodioInfo,
+    limpiar_nombre_archivo, palabras_fuertes, similitud, titulo_compuesto, titulo_episodio,
+    EpisodioInfo,
 };
 use crate::tmdb::{
     buscar_candidatos_pelicula, buscar_candidatos_serie, buscar_coleccion_pelicula,
-    buscar_nombre_serie, buscar_numeros_episodios, buscar_temporada, Candidato, ErrorTmdb,
+    buscar_nombre_serie, buscar_nombres_episodio_traducidos, buscar_numeros_episodios,
+    buscar_temporada, Candidato, ErrorTmdb,
 };
 use reqwest::blocking::Client;
 use std::collections::HashMap;
@@ -228,6 +230,58 @@ fn episodio_se_llama(
         Some(n) => Ok(cobertura_palabras(titulo_archivo, &n) >= COBERTURA_MINIMA_EPISODIO),
         None => Ok(false),
     }
+}
+
+/// Parecido mínimo entre el título de capítulo del archivo y el mismo título
+/// en OTRO idioma.
+///
+/// Es mucho más alto que [`COBERTURA_MINIMA_EPISODIO`] porque compara contra
+/// idiomas distintos y la medida es ruidosa: en `Dalgliesh` la serie correcta
+/// llegó a 0.842-0.923 (catalán) pero la equivocada rozó 0.646, así que el
+/// margen real es estrecho y solo un umbral alto lo respeta.
+const PARECIDO_MINIMO_TRADUCCION: f64 = 0.80;
+
+/// Cuánto se parece el título de capítulo que trae el archivo a un nombre que
+/// TMDb da a ese episodio en algún idioma.
+///
+/// Se queda con la mejor de las dos medidas porque cada una cubre una
+/// deformación distinta: la **cobertura** cuando el archivo trae el título
+/// recortado o sin tildes (misma lengua), y la **similitud** cuando el idioma
+/// es otro y las palabras no coinciden pero se parecen letra a letra
+/// ("Sudario para un ruiseñor" contra el catalán "Sudari per a un rossinyol").
+fn parecido_traduccion(titulo_archivo: &str, nombre: &str) -> f64 {
+    cobertura_palabras(titulo_archivo, nombre).max(similitud(titulo_archivo, nombre, nombre))
+}
+
+/// ¿Alguna de las traducciones que TMDb tiene de este episodio se llama como
+/// dice el archivo?
+///
+/// Es el plan E preguntando en todos los idiomas en vez de solo en el
+/// configurado. Ver `buscar_nombres_episodio_traducidos` para por qué el
+/// genérico de TMDb no cuenta como traducción.
+fn episodio_se_llama_traducido(
+    client: &Client,
+    opts: &Opciones,
+    series_id: i64,
+    ep: EpisodioInfo,
+    titulo_archivo: &str,
+) -> Result<bool, String> {
+    let nombres = buscar_nombres_episodio_traducidos(
+        client,
+        &opts.api_key,
+        series_id,
+        ep.temporada,
+        ep.episodio,
+    )
+    .map_err(|e| {
+        format!(
+            "no se pudieron obtener las traducciones del episodio {}x{:02} de la serie {}: {}",
+            ep.temporada, ep.episodio, series_id, e
+        )
+    })?;
+    Ok(nombres
+        .iter()
+        .any(|n| parecido_traduccion(titulo_archivo, n) >= PARECIDO_MINIMO_TRADUCCION))
 }
 
 /// ¿El mejor candidato basta para renombrar sin supervisión? Score por encima
@@ -493,14 +547,48 @@ pub fn procesar_archivo(
         // ningún candidato y el desempate se descarta sin efecto, igual que
         // los planes B y C: esto solo puede rescatar lo que hoy va a
         // `_revisar`, nunca estropear un nombre que ya funciona.
+        //
+        // Un sufijo sin palabras fuertes ("de la") daría cobertura 1.00 contra
+        // cualquier cosa: no distingue nada y solo gasta llamadas, así que los
+        // planes E y F lo descartan de entrada.
+        let titulo_ep = titulo_episodio(&nombre).filter(|t| !palabras_fuertes(t).is_empty());
         let candidatos = match eleccion_firme(&candidatos, opts) {
             true => candidatos,
-            // Un sufijo sin palabras fuertes ("de la") daría cobertura 1.00
-            // contra cualquier cosa: no distingue nada y solo gasta llamadas.
-            false => match titulo_episodio(&nombre).filter(|t| !palabras_fuertes(t).is_empty()) {
+            false => match &titulo_ep {
                 Some(titulo_ep) => {
                     match desempatar_por_episodio(&candidatos, opts.umbral, |id| {
-                        episodio_se_llama(client, opts, cache, id, ep, &titulo_ep)
+                        episodio_se_llama(client, opts, cache, id, ep, titulo_ep)
+                    }) {
+                        Ok(Some(ganador)) => vec![ganador],
+                        Ok(None) => candidatos,
+                        Err(e) => return Resultado::ErrorRed(e),
+                    }
+                }
+                None => candidatos,
+            },
+        };
+
+        // Plan F: el plan E pregunta el nombre del capítulo en el idioma
+        // configurado, y cuando TMDb no tiene esa traducción no contesta
+        // "no lo sé": rellena con un genérico ("Episodio 1") que puntúa igual
+        // contra las dos homónimas y por tanto no desempata nada. Las
+        // traducciones a OTROS idiomas sí traen el título de verdad.
+        //
+        // `Dalgliesh 1x03` empata a 1.00 entre `Dalgliesh` (2021) y `Dalgliesh`
+        // (1983), las dos con los seis capítulos de la T1 y las dos con
+        // "Episodio 3" en es-ES. En catalán, la de 2021 lo titula "La torre
+        // negra (1)", que es exactamente lo que dice el archivo.
+        //
+        // Comparar contra todos los idiomas es ruidoso —la serie equivocada
+        // llegó a 0.646 por parecido casual—, de ahí el umbral alto. El
+        // contrato es el de siempre: solo entra si la elección no es firme y
+        // solo gana si sobrevive exactamente un candidato.
+        let candidatos = match eleccion_firme(&candidatos, opts) {
+            true => candidatos,
+            false => match &titulo_ep {
+                Some(titulo_ep) => {
+                    match desempatar_por_episodio(&candidatos, opts.umbral, |id| {
+                        episodio_se_llama_traducido(client, opts, id, ep, titulo_ep)
                     }) {
                         Ok(Some(ganador)) => vec![ganador],
                         Ok(None) => candidatos,
@@ -938,6 +1026,116 @@ mod tests {
             assert_eq!(cobertura_palabras(suf, real), 1.0);
             assert_eq!(cobertura_palabras(suf, nombre_1x06(58791)), 0.0);
         }
+    }
+
+    /// Las dos series llamadas exactamente "Dalgliesh": la de 2021 y la de
+    /// 1983. Las dos tienen los seis capitulos de la T1 y las dos los titulan
+    /// "Episodio N" en es-ES, asi que ni el plan D ni el plan E las separan.
+    fn los_dos_dalgliesh() -> Vec<Candidato> {
+        vec![
+            cand_id(137127, "Dalgliesh", "2021", 1.0, 12.30),
+            cand_id(29704, "Dalgliesh", "1983", 1.0, 6.75),
+        ]
+    }
+
+    /// Traducciones reales que TMDb da al 1x03 de cada una, ya sin genericos
+    /// (los filtra `buscar_nombres_episodio_traducidos`). La de 1983 solo esta
+    /// traducida al ingles.
+    fn traducciones_1x03(id: i64) -> Vec<&'static str> {
+        match id {
+            137127 => vec![
+                "The Black Tower (1)",
+                "Der schwarze Turm - Teil 1",
+                "La torre nera (1)",
+                "La torre negra (1)",
+            ],
+            _ => vec!["Death Of An Expert Witness (3)"],
+        }
+    }
+
+    #[test]
+    fn una_traduccion_a_otro_idioma_rompe_el_empate_que_el_espanol_no_puede() {
+        // Caso real de `Dalgliesh.1x03`: empate a 1.00, las DOS series tienen
+        // un 1x03 (plan D sin argumentos) y las DOS lo titulan "Episodio 3" en
+        // es-ES (plan E sin argumentos). Lo que las separa es el catalan.
+        let cs = los_dos_dalgliesh();
+        let suf = titulo_episodio(
+            "Dalgliesh.1x03.La.torre.negra.Parte.1.(Spanish.English.Subs).WEBRip.1080p.x264-AC3.by.Mony2007.mkv",
+        )
+        .expect("el sufijo es el titulo del capitulo");
+
+        // Plan E: preguntando solo en es-ES, las dos contestan lo mismo.
+        assert!(desempatar_por_episodio(&cs, 0.85, |_| Ok(
+            cobertura_palabras(&suf, "Episodio 3") >= COBERTURA_MINIMA_EPISODIO
+        ))
+        .unwrap()
+        .is_none());
+
+        // Plan F: preguntando en todos los idiomas, solo sobrevive una.
+        let ganador = desempatar_por_episodio(&cs, 0.85, |id| {
+            Ok(traducciones_1x03(id)
+                .iter()
+                .any(|n| parecido_traduccion(&suf, n) >= PARECIDO_MINIMO_TRADUCCION))
+        })
+        .unwrap()
+        .expect("solo una de las dos titula asi su 1x03");
+        assert_eq!(ganador.id, 137127);
+    }
+
+    #[test]
+    fn el_umbral_de_traduccion_respeta_el_margen_medido() {
+        // Fija la medicion con la que se eligio PARECIDO_MINIMO_TRADUCCION,
+        // sobre los nombres reales de TMDb. Comparar entre idiomas es ruidoso y
+        // el margen es estrecho: en "Filia por la muerte" la serie correcta
+        // (0.647) y la equivocada (0.646) quedan a una milesima, asi que el
+        // umbral tiene que dejar fuera a las DOS y mandar el archivo a revision
+        // en vez de acertar por suerte. Bajarlo para rescatar ese caso haria
+        // ganar a la serie de 1983 en el siguiente.
+        let casos = [
+            (
+                "Sudario para un ruiseñor Parte 1",
+                "Sudari per a un rossinyol (1)",
+                "Death Of An Expert Witness (1)",
+                true,
+            ),
+            (
+                "La torre negra Parte 1",
+                "La torre negra (1)",
+                "Death Of An Expert Witness (3)",
+                true,
+            ),
+            (
+                "Filia por la muerte Parte 1",
+                "Un gusto per la morte (1)",
+                "Death Of An Expert Witness (5)",
+                false,
+            ),
+        ];
+        for (archivo, correcta, equivocada, rescatable) in casos {
+            let buena = parecido_traduccion(archivo, correcta);
+            let mala = parecido_traduccion(archivo, equivocada);
+            assert_eq!(
+                buena >= PARECIDO_MINIMO_TRADUCCION,
+                rescatable,
+                "{archivo} vs {correcta}: {buena}"
+            );
+            assert!(
+                mala < PARECIDO_MINIMO_TRADUCCION,
+                "{archivo} vs {equivocada}: {mala}"
+            );
+        }
+    }
+
+    #[test]
+    fn la_cobertura_sola_no_habria_visto_la_traduccion() {
+        // Por que el plan F mide max(cobertura, similitud) y no la cobertura a
+        // secas del plan E: en otro idioma las palabras no coinciden aunque el
+        // titulo sea el mismo, y la cobertura no llega. Quien lo ve es la
+        // similitud letra a letra.
+        let archivo = "La torre negra Parte 1";
+        let italiano = "La torre nera (1)";
+        assert!(cobertura_palabras(archivo, italiano) < COBERTURA_MINIMA_EPISODIO);
+        assert!(parecido_traduccion(archivo, italiano) >= PARECIDO_MINIMO_TRADUCCION);
     }
 
     #[test]

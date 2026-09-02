@@ -401,3 +401,92 @@ pub fn buscar_nombre_episodio(
         .and_then(|n| n.as_str())
         .map(|s| s.to_string())
 }
+
+/// Nombres que TMDb tiene para un episodio en **todos** los idiomas
+/// (`/tv/{id}/season/{s}/episode/{e}/translations`), no solo en el configurado.
+///
+/// Se descartan los vacíos y los **genéricos** (`"Episodio 6"`, `"Episode 6"`).
+/// Ese relleno es justo lo que hace inútil preguntar en un solo idioma: cuando
+/// falta la traducción, TMDb no devuelve vacío, devuelve el genérico, que
+/// puntúa igual contra cualquier archivo y contra cualquier serie homónima.
+///
+/// `NoEncontrado` (404) es una respuesta válida —ese episodio no existe en esta
+/// serie— y se traduce a lista vacía, no a fallo.
+pub fn buscar_nombres_episodio_traducidos(
+    client: &Client,
+    api_key: &str,
+    series_id: i64,
+    temporada: u32,
+    episodio: u32,
+) -> Result<Vec<String>, ErrorTmdb> {
+    let url = format!(
+        "{}/tv/{}/season/{}/episode/{}/translations",
+        BASE_URL, series_id, temporada, episodio
+    );
+    let datos = match get_json(client, &url, &[("api_key", api_key)]) {
+        Ok(d) => d,
+        Err(ErrorTmdb::NoEncontrado) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let lista = match datos.get("translations").and_then(|t| t.as_array()) {
+        Some(l) => l,
+        None => return Ok(Vec::new()),
+    };
+    Ok(lista
+        .iter()
+        .filter_map(|t| t.pointer("/data/name").and_then(|n| n.as_str()))
+        .map(|n| n.trim())
+        .filter(|n| !n.is_empty() && !es_nombre_generico(n, episodio))
+        .map(|n| n.to_string())
+        .collect())
+}
+
+/// ¿Este nombre de episodio es el relleno de TMDb en vez de un título de verdad?
+///
+/// La regla no depende del idioma: un genérico es **una sola palabra** seguida
+/// del número de ese capítulo (`"Episodio 6"`, `"Episode 6"`, `"Folge 6"`).
+/// Exigir las dos cosas protege los títulos legítimos por los dos lados:
+/// `"Radio"` es una palabra suelta pero no lleva número, y `"La torre negra
+/// (1)"` lleva número pero no es una palabra suelta.
+fn es_nombre_generico(nombre: &str, episodio: u32) -> bool {
+    let palabras = nombre
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|p| !p.is_empty())
+        .count();
+    if palabras != 1 {
+        return false;
+    }
+    nombre
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|d| !d.is_empty())
+        .any(|d| d.parse::<u32>().ok() == Some(episodio))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn el_relleno_de_tmdb_se_reconoce_en_cualquier_idioma() {
+        for n in [
+            "Episodio 6",
+            "Episode 6",
+            "Folge 6",
+            "Épisode 6",
+            "episodio 6",
+        ] {
+            assert!(es_nombre_generico(n, 6), "{n}");
+        }
+    }
+
+    #[test]
+    fn un_titulo_de_verdad_no_pasa_por_generico() {
+        // Una palabra suelta pero sin numero, y titulos con numero de parte:
+        // los tres son titulos reales y el plan F los necesita.
+        assert!(!es_nombre_generico("Radio", 3));
+        assert!(!es_nombre_generico("La torre negra (1)", 3));
+        assert!(!es_nombre_generico("Sudari per a un rossinyol (1)", 1));
+        // El generico de OTRO episodio tampoco cuenta: no es el relleno de este.
+        assert!(!es_nombre_generico("Episodio 6", 3));
+    }
+}
