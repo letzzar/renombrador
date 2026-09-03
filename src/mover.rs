@@ -100,23 +100,68 @@ mod permisos {
     /// hacer nada en un montaje que no los soporte.
     pub fn aplicar(ruta: &Path, modo: Option<u32>, uid: Option<u32>, gid: Option<u32>) {
         use std::os::unix::fs::PermissionsExt;
-        let actual = estado_de(ruta);
+        let antes = estado_de(ruta);
 
         // El chown va antes que el chmod: cambiar de propietario limpia los
         // bits setuid/setgid, así que al revés desharía un modo tipo 2775.
-        let hay_que_cambiar_duenio = match actual {
+        let hubo_chown = match antes {
             Some((_, u, g, _)) => uid.is_some_and(|n| n != u) || gid.is_some_and(|n| n != g),
             None => uid.is_some() || gid.is_some(),
         };
-        if hay_que_cambiar_duenio {
+        if hubo_chown {
             let _ = std::os::unix::fs::chown(ruta, uid, gid);
         }
 
         if let Some(modo) = modo {
-            if actual.map(|a| a.0) != Some(modo) {
+            // El modo se compara con el de AHORA, no con el de antes del chown.
+            // En un recurso con ACL de Synology, cambiar de dueño reescribe los
+            // bits POSIX y los deja a cero, así que el estado previo ya no dice
+            // nada del archivo que tenemos delante. Mirarlo hacía creer que "ya
+            // estaba bien" un `777` que el chown acababa de destruir, y el
+            // archivo se quedaba en `000` sin que nadie lo tocara. Las carpetas
+            // no lo enseñaban porque necesitaban el chmod igual, para subir del
+            // `755` que deja la umask.
+            let ahora = if hubo_chown { estado_de(ruta) } else { antes };
+            if ahora.map(|a| a.0) != Some(modo) {
                 let _ = fs::set_permissions(ruta, fs::Permissions::from_mode(modo));
             }
         }
+    }
+
+    /// Comprueba el resultado y describe la diferencia si no es el que se pidió.
+    /// `None` cuando quedó como debía.
+    ///
+    /// Devuelve el texto en vez de imprimirlo para poder probarlo: el caso que
+    /// tiene que cazar solo se da con root sobre un recurso con ACL, y sin esto
+    /// no habría forma de fijar cuándo salta.
+    pub fn discrepancia(
+        ruta: &Path,
+        modo: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Option<String> {
+        let (m, u, g, _) = estado_de(ruta)?;
+        let modo_mal = modo.is_some_and(|q| q != m);
+        let duenio_mal = uid.is_some_and(|q| q != u) || gid.is_some_and(|q| q != g);
+        if !modo_mal && !duenio_mal {
+            return None;
+        }
+        let pedido = |v: Option<u32>, octal: bool| match (v, octal) {
+            (Some(v), true) => format!("{:o}", v),
+            (Some(v), false) => v.to_string(),
+            (None, _) => "-".to_string(),
+        };
+        Some(format!(
+            "'{}' quedó en {:o} {}:{} y se le pidió {} {}:{} \
+             (¿ACL del recurso rechazando el cambio?)",
+            ruta.display(),
+            m,
+            u,
+            g,
+            pedido(modo, true),
+            pedido(uid, false),
+            pedido(gid, false),
+        ))
     }
 }
 
@@ -448,6 +493,29 @@ fn normalizar_archivo(ruta: &Path, h: Herencia, origen: Origen) {
     permisos::aplicar(ruta, modo, uid, gid);
 }
 
+/// Repasa el archivo ya en su nombre definitivo y avisa si no quedó como se
+/// pidió.
+///
+/// Se vuelve a aplicar porque el `rename` final es otro punto donde el recurso
+/// puede reinterpretar los permisos, y `aplicar` no cuesta nada cuando ya está
+/// todo bien: es justo lo que no toca nada.
+#[cfg(unix)]
+fn repasar_archivo(ruta: &Path, h: Herencia, origen: Origen) {
+    let (modo, uid, gid) = h.para_archivo(origen);
+    permisos::aplicar(ruta, modo, uid, gid);
+    // El aviso va por `stderr`, con el mismo formato que el log del servicio, y
+    // no por un `Result`: el archivo ya está movido y en su sitio, así que esto
+    // no es un fallo de la operación sino el sistema de archivos negándose a lo
+    // que le pedimos. Callarlo es lo que costó un ciclo entero de pruebas para
+    // ver un `000` en la biblioteca.
+    if let Some(aviso) = permisos::discrepancia(ruta, modo, uid, gid) {
+        eprintln!("[WARN] {}", aviso);
+    }
+}
+
+#[cfg(not(unix))]
+fn repasar_archivo(_ruta: &Path, _h: Herencia, _origen: Origen) {}
+
 #[cfg(not(unix))]
 fn normalizar_archivo(_ruta: &Path, _h: Herencia, _origen: Origen) {}
 
@@ -557,7 +625,7 @@ pub fn mover_seguro(origen: &Path, destino: &Path) -> Result<(), String> {
     // Primero intentamos un rename (rápido, atómico). Si falla —probablemente
     // por estar en otro sistema de archivos— copiamos y borramos el origen.
     if fs::rename(origen, destino).is_ok() {
-        normalizar_archivo(destino, herencia, origen_previo);
+        repasar_archivo(destino, herencia, origen_previo);
         return Ok(());
     }
 
@@ -584,6 +652,10 @@ pub fn mover_seguro(origen: &Path, destino: &Path) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         format!("error al renombrar '{}' a su nombre final: {}", tmp.display(), e)
     })?;
+    // Y se repasa ya con su nombre definitivo: el `rename` es otro punto donde
+    // el recurso puede reinterpretar los permisos, y si algo no cuadró, esto es
+    // lo que lo dice en el log en vez de dejarlo callado en la biblioteca.
+    repasar_archivo(destino, herencia, origen_previo);
     fs::remove_file(origen)
         .map_err(|e| format!("copiado correctamente pero no se pudo borrar el origen: {}", e))?;
     Ok(())
@@ -976,6 +1048,53 @@ mod tests {
             antes,
             "ni siquiera se ha tocado el inodo: no hubo chmod"
         );
+        let _ = fs::remove_dir_all(&raiz);
+    }
+
+    /// Lo que hay que cambiar se cambia, aunque lo de al lado ya estuviera bien.
+    ///
+    /// El fallo del 03-09-2026 vivía justo aquí: `aplicar` decidía el `chmod`
+    /// mirando el estado leído ANTES del `chown`, y en el NAS ese `chown` deja
+    /// los bits POSIX a cero. El archivo llegaba con el modo correcto, el chown
+    /// se lo borraba y la comparación con el estado viejo decía "ya está bien".
+    ///
+    /// El caso completo necesita root y un recurso con ACL, así que aquí solo se
+    /// fija la mitad comprobable: cuando el modo no es el pedido, se aplica.
+    #[test]
+    fn un_modo_distinto_del_pedido_si_se_aplica() {
+        let raiz = caja("modo-distinto");
+        let f = raiz.join("x.mkv");
+        fs::write(&f, b"video").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+
+        permisos::aplicar(&f, Some(0o664), None, None);
+
+        assert_eq!(modo(&f), 0o664);
+        let _ = fs::remove_dir_all(&raiz);
+    }
+
+    /// Y si aun así no queda como se pidió, se dice. Un `000` en la biblioteca
+    /// costó un ciclo entero de pruebas por no aparecer en ningún log.
+    #[test]
+    fn un_resultado_que_no_cuadra_se_describe() {
+        let raiz = caja("no-cuadra");
+        let f = raiz.join("x.mkv");
+        fs::write(&f, b"video").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+        let (uid_real, gid_real) = duenio(&f);
+
+        // El escenario exacto del NAS: se pidió 777 y quedó en 000.
+        let aviso = permisos::discrepancia(&f, Some(0o777), Some(uid_real), Some(gid_real))
+            .expect("un 000 donde se pedía 777 tiene que saltar");
+        assert!(aviso.contains("quedó en 0"), "{aviso}");
+        assert!(aviso.contains("se le pidió 777"), "{aviso}");
+
+        // Y cuando sí cuadra, no se dice nada.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            permisos::discrepancia(&f, Some(0o777), Some(uid_real), Some(gid_real)).is_none()
+        );
+
         let _ = fs::remove_dir_all(&raiz);
     }
 
