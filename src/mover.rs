@@ -265,8 +265,9 @@ fn modo_de_carpeta(modo_archivo: u32) -> u32 {
     (modo_archivo & 0o777) | (lectura >> 2)
 }
 
-/// Lo que el archivo de origen trae puesto y hay que conservarle. Vacío en
-/// plataformas sin permisos POSIX.
+/// Lo que el archivo de origen trae puesto y hay que conservarle: modo, dueño,
+/// grupo y fechas. Los tres primeros solo existen en plataformas POSIX; las
+/// fechas, en todas.
 #[derive(Clone, Copy, Default)]
 pub struct Origen {
     #[cfg(unix)]
@@ -275,27 +276,66 @@ pub struct Origen {
     uid: Option<u32>,
     #[cfg(unix)]
     gid: Option<u32>,
+    accedido: Option<std::time::SystemTime>,
+    modificado: Option<std::time::SystemTime>,
 }
 
 impl Origen {
     /// Se lee **antes** de mover nada: en cuanto el archivo cambia de sitio (o
-    /// se copia, que lo deja del dueño del proceso) ya no se puede preguntar.
-    #[cfg(unix)]
+    /// se copia, que lo deja del dueño del proceso y con la fecha de hoy) ya no
+    /// se puede preguntar.
     pub fn de(ruta: &Path) -> Self {
-        match permisos::estado_de(ruta) {
-            Some((m, u, g, _)) => Self {
-                modo: Some(m),
-                uid: Some(u),
-                gid: Some(g),
-            },
-            None => Self::default(),
+        match fs::metadata(ruta) {
+            Ok(meta) => Self::de_metadata(&meta),
+            Err(_) => Self::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn de_metadata(meta: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            modo: Some(meta.mode() & 0o7777),
+            uid: Some(meta.uid()),
+            gid: Some(meta.gid()),
+            accedido: meta.accessed().ok(),
+            modificado: meta.modified().ok(),
         }
     }
 
     #[cfg(not(unix))]
-    pub fn de(_ruta: &Path) -> Self {
-        Self::default()
+    fn de_metadata(meta: &fs::Metadata) -> Self {
+        Self {
+            accedido: meta.accessed().ok(),
+            modificado: meta.modified().ok(),
+        }
     }
+}
+
+/// Copia las fechas del origen al archivo depositado, como hace `cp -p`.
+///
+/// `fs::copy` trae el contenido y el modo, pero deja la fecha de modificación
+/// del destino en "ahora". Un `rename` sí las conserva, así que esto solo tiene
+/// efecto en el camino de copia —el que se usa de verdad, porque descargas y
+/// biblioteca son montajes distintos— y ahí es donde se perdían: un capítulo
+/// bajado hace meses aterrizaba en la biblioteca como recién estrenado y
+/// cualquier orden por fecha mentía.
+///
+/// Un fallo aquí no es fatal: el archivo está en su sitio y con sus permisos, y
+/// la fecha es lo único que se queda sin arreglar.
+fn preservar_fechas(ruta: &Path, origen: Origen) {
+    let (Some(accedido), Some(modificado)) = (origen.accedido, origen.modificado) else {
+        return;
+    };
+    // `set_times` exige el archivo abierto para escritura.
+    let Ok(f) = fs::OpenOptions::new().write(true).open(ruta) else {
+        return;
+    };
+    let _ = f.set_times(
+        fs::FileTimes::new()
+            .set_accessed(accedido)
+            .set_modified(modificado),
+    );
 }
 
 impl Herencia {
@@ -687,9 +727,12 @@ pub fn mover_seguro(origen: &Path, destino: &Path) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         format!("error al copiar a '{}': {}", tmp.display(), e)
     })?;
-    // Ajustamos permisos y propietario sobre el `.part`, antes del rename
-    // final: así el archivo nunca llega a existir con su nombre definitivo y
-    // permisos malos, y un escaneo de la biblioteca no puede pillarlo así.
+    // Ajustamos permisos, propietario y fechas sobre el `.part`, antes del
+    // rename final: así el archivo nunca llega a existir con su nombre
+    // definitivo y permisos malos, y un escaneo de la biblioteca no puede
+    // pillarlo así. Las fechas van primero porque escribir el contenido es lo
+    // que las mueve, y ni el chown ni el chmod las tocan.
+    preservar_fechas(&tmp, origen_previo);
     normalizar_archivo(&tmp, herencia, origen_previo);
     fs::rename(&tmp, destino).map_err(|e| {
         let _ = fs::remove_file(&tmp);
@@ -743,6 +786,25 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn modificado(p: &Path) -> std::time::SystemTime {
+        fs::metadata(p).unwrap().modified().unwrap()
+    }
+
+    /// Le pone al archivo una fecha vieja y concreta, para poder reconocerla al
+    /// otro lado.
+    fn envejecer(p: &Path, dias: u64) -> std::time::SystemTime {
+        let cuando = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000 - dias * 86_400);
+        let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.set_times(
+            fs::FileTimes::new()
+                .set_accessed(cuando)
+                .set_modified(cuando),
+        )
+        .unwrap();
+        cuando
     }
 
     /// El bug original: un archivo que llega a descargas sin permisos se
@@ -1028,6 +1090,7 @@ mod tests {
             modo: Some(modo),
             uid: Some(uid),
             gid: Some(gid),
+            ..Origen::default()
         }
     }
 
@@ -1141,6 +1204,55 @@ mod tests {
         let _ = fs::remove_dir_all(&raiz);
     }
 
+    /// Mover es `cp -p`, no `cp`: la fecha del archivo llega al destino.
+    ///
+    /// Se prueba cruzando de sistema de archivos, que es el camino que se usa de
+    /// verdad (descargas y biblioteca son montajes distintos) y el único donde
+    /// se perdía: un `rename` conserva las fechas solo, pero una copia deja el
+    /// destino con la de hoy y el capítulo aparece en la biblioteca como recién
+    /// estrenado.
+    #[test]
+    fn mover_entre_sistemas_de_archivos_conserva_la_fecha() {
+        let otro_fs = Path::new("/dev/shm");
+        if !otro_fs.is_dir() {
+            return;
+        }
+        let origen_dir = otro_fs.join(format!("renombrador-test-fecha-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&origen_dir);
+        if fs::create_dir_all(&origen_dir).is_err() {
+            return;
+        }
+        let raiz = caja("fecha");
+
+        let origen = origen_dir.join("origen.mkv");
+        fs::write(&origen, b"video").unwrap();
+        let esperada = envejecer(&origen, 90);
+
+        // Si las dos rutas están en el mismo sistema de archivos, esto iría por
+        // `rename` y no probaría el camino de copia.
+        let sonda = origen_dir.join("sonda");
+        fs::write(&sonda, b"x").unwrap();
+        let cruza_fs = fs::rename(&sonda, raiz.join("sonda")).is_err();
+        let _ = fs::remove_file(&sonda);
+        let _ = fs::remove_file(raiz.join("sonda"));
+        if !cruza_fs {
+            let _ = fs::remove_dir_all(&origen_dir);
+            let _ = fs::remove_dir_all(&raiz);
+            return;
+        }
+
+        let destino = raiz.join("series/Serie (2025)/Season 01/Serie 1x01.mkv");
+        mover_seguro(&origen, &destino).unwrap();
+
+        assert_eq!(
+            modificado(&destino),
+            esperada,
+            "la fecha del origen, no la del movimiento"
+        );
+        let _ = fs::remove_dir_all(&origen_dir);
+        let _ = fs::remove_dir_all(&raiz);
+    }
+
     /// El caso que dejaba el `000` en la biblioteca: el archivo llega ilegible
     /// **y** la carpeta de destino no da referencia (`/series` es un recurso con
     /// ACL y sus bits POSIX se leen a cero). Con las dos fuentes fuera, "no
@@ -1200,6 +1312,7 @@ mod tests {
             modo: Some(0o664),
             uid: None,
             gid: None,
+            ..Origen::default()
         };
         assert_eq!(
             biblioteca().para_archivo(sin_duenio),
