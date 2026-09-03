@@ -38,6 +38,17 @@ impl SeriesCache {
         }
     }
 
+    /// Caché que no persiste nada.
+    ///
+    /// La app de escritorio guarda sus series resueltas en su propio archivo de
+    /// configuración, pero necesita las cachés **en memoria** —temporadas e info
+    /// de serie— para decidir igual que el servicio sin repetir llamadas. Sin
+    /// ruta a la que escribir, `insertar` no tiene dónde guardar, así que esta
+    /// caché solo debe usarse para eso.
+    pub fn solo_memoria() -> Self {
+        Self::default()
+    }
+
     pub fn get(&self, clave: &str) -> Option<i64> {
         self.map.get(clave).copied()
     }

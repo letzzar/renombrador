@@ -19,8 +19,10 @@ use std::{
     thread,
 };
 
+use renombrador::cache::SeriesCache;
 use renombrador::config::Idioma;
 use renombrador::mover::renombrar_si_seguro;
+use renombrador::organizer::{eleccion_firme, elegir_serie, titulo_de_capitulo, Busqueda};
 use renombrador::parse::{
     clave_cache_titulo, extraer_info_archivo, limpiar_nombre_archivo, EpisodioInfo,
 };
@@ -210,6 +212,11 @@ impl AppRenombrador {
             };
 
             let client = Client::new();
+            // Cachés en memoria (temporadas e info de serie) que los desempates
+            // usan para no repetir llamadas dentro de un mismo lote. Las series
+            // resueltas se siguen guardando en `cache_series`, que es la que
+            // persiste en la configuración de la app.
+            let mut cache_temporadas = SeriesCache::solo_memoria();
 
             for entrada in archivos.flatten() {
                 let path = entrada.path();
@@ -283,15 +290,27 @@ impl AppRenombrador {
                         continue;
                     }
 
-                    // Capa 2: búsqueda progresiva multi-query.
-                    let candidatos = match buscar_candidatos_serie(
+                    // Capa 2: búsqueda progresiva multi-query, con la misma
+                    // escalera de rescates que el servicio (planes B-F). Antes
+                    // aquí solo había una búsqueda pelada: dos series llamadas
+                    // exactamente igual se resolvían con la más popular y sin
+                    // avisar, que es peor que mandarlas a revisión.
+                    let busqueda = Busqueda {
+                        api_key: &api_key,
+                        idioma: idioma_titulo,
+                        umbral: UMBRAL_AUTO,
+                    };
+                    let candidatos = match elegir_serie(
                         &client,
+                        busqueda,
+                        &mut cache_temporadas,
+                        &nombre_archivo,
                         &titulo_extraido,
                         anio_extraido,
-                        &api_key,
-                        idioma_titulo,
+                        ep,
+                        clave.clone(),
                     ) {
-                        Ok(c) => c,
+                        Ok((c, _clave)) => c,
                         Err(e) => {
                             let _ = tx.send(MensajeUI::Log(format!(
                                 "  -> Error de red: {}. Se omite; vuelve a procesar más tarde.",
@@ -331,8 +350,10 @@ impl AppRenombrador {
                     }
 
                     let mejor = &candidatos[0];
-                    // La variante desesperada nunca auto-renombra por score.
-                    if mejor.score >= UMBRAL_AUTO && mejor.fiable {
+                    // Ni la variante desesperada ni un empate auto-renombran:
+                    // con dos candidatos a menos de un pelo, quien decidiría es
+                    // la popularidad, y para eso está la revisión manual.
+                    if eleccion_firme(&candidatos, UMBRAL_AUTO) {
                         match renombrar_episodio_con_id(
                             &client,
                             &api_key,
@@ -796,8 +817,14 @@ fn renombrar_episodio_con_id(
 ) -> Result<String, String> {
     let (titulo_serie, _anio) = buscar_nombre_serie(client, api_key, idioma, series_id)
         .map_err(|e| format!("no se pudo obtener info de la serie {}: {}", series_id, e))?;
-    let nombre_episodio =
-        buscar_nombre_episodio(client, api_key, idioma, series_id, ep.temporada, ep.episodio);
+    // Cuando TMDb solo ofrece su relleno ("Episodio 1"), manda el título que
+    // trae el propio archivo: a menudo es el único sitio donde ese capítulo
+    // existe en español. Misma regla que en el servicio.
+    let nombre_episodio = titulo_de_capitulo(
+        buscar_nombre_episodio(client, api_key, idioma, series_id, ep.temporada, ep.episodio),
+        path,
+        ep,
+    );
     let titulo_limpio = limpiar_nombre_archivo(&titulo_serie);
     let formato_ep = if formato_episodio {
         format!("{}x{:02}", ep.temporada, ep.episodio)

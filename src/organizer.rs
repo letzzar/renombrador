@@ -60,6 +60,31 @@ pub struct Opciones {
     pub dry_run: bool,
 }
 
+/// Lo justo para preguntarle a TMDb quién es una serie: ni carpetas, ni acción
+/// ante la duda, ni nada de mover.
+///
+/// Existe para que la app de escritorio pueda usar la misma escalera de
+/// decisión que el servicio. La app renombra en el sitio, no mueve nada a
+/// ninguna biblioteca, así que no tiene `Opciones` ni debería inventarse una
+/// para poder hacer la misma pregunta.
+#[derive(Clone, Copy)]
+pub struct Busqueda<'a> {
+    pub api_key: &'a str,
+    pub idioma: Idioma,
+    /// Score por encima del cual se acepta un candidato sin supervisión.
+    pub umbral: f64,
+}
+
+impl Opciones {
+    pub fn busqueda(&self) -> Busqueda<'_> {
+        Busqueda {
+            api_key: &self.api_key,
+            idioma: self.idioma,
+            umbral: self.umbral,
+        }
+    }
+}
+
 /// Margen de similitud dentro del cual dos candidatos se consideran empatados.
 const EMPATE: f64 = 0.02;
 
@@ -148,11 +173,11 @@ where
 /// temporada es una respuesta válida (no la tiene), no un fallo.
 fn serie_tiene_episodio(
     client: &Client,
-    opts: &Opciones,
+    b: Busqueda,
     series_id: i64,
     ep: EpisodioInfo,
 ) -> Result<bool, String> {
-    match buscar_numeros_episodios(client, &opts.api_key, opts.idioma, series_id, ep.temporada) {
+    match buscar_numeros_episodios(client, b.api_key, b.idioma, series_id, ep.temporada) {
         Ok(numeros) => Ok(numeros.contains(&ep.episodio)),
         Err(ErrorTmdb::NoEncontrado) => Ok(false),
         Err(e @ ErrorTmdb::Red(_)) => Err(format!(
@@ -171,7 +196,7 @@ fn serie_tiene_episodio(
 /// que un `None` **no** significa que el episodio no exista.
 fn nombre_de_episodio(
     client: &Client,
-    opts: &Opciones,
+    b: Busqueda,
     cache: &mut SeriesCache,
     series_id: i64,
     ep: EpisodioInfo,
@@ -179,13 +204,7 @@ fn nombre_de_episodio(
     if let Some(m) = cache.temporada(series_id, ep.temporada) {
         return Ok(m.get(&ep.episodio).cloned());
     }
-    match buscar_temporada(
-        client,
-        &opts.api_key,
-        opts.idioma,
-        series_id,
-        ep.temporada,
-    ) {
+    match buscar_temporada(client, b.api_key, b.idioma, series_id, ep.temporada) {
         Ok(m) => {
             let nombre = m.get(&ep.episodio).cloned();
             cache.insertar_temporada(series_id, ep.temporada, m);
@@ -220,13 +239,13 @@ const COBERTURA_MINIMA_EPISODIO: f64 = 0.75;
 /// nombre del archivo.
 fn episodio_se_llama(
     client: &Client,
-    opts: &Opciones,
+    b: Busqueda,
     cache: &mut SeriesCache,
     series_id: i64,
     ep: EpisodioInfo,
     titulo_archivo: &str,
 ) -> Result<bool, String> {
-    match nombre_de_episodio(client, opts, cache, series_id, ep)? {
+    match nombre_de_episodio(client, b, cache, series_id, ep)? {
         Some(n) => Ok(cobertura_palabras(titulo_archivo, &n) >= COBERTURA_MINIMA_EPISODIO),
         None => Ok(false),
     }
@@ -261,14 +280,14 @@ fn parecido_traduccion(titulo_archivo: &str, nombre: &str) -> f64 {
 /// genérico de TMDb no cuenta como traducción.
 fn episodio_se_llama_traducido(
     client: &Client,
-    opts: &Opciones,
+    b: Busqueda,
     series_id: i64,
     ep: EpisodioInfo,
     titulo_archivo: &str,
 ) -> Result<bool, String> {
     let nombres = buscar_nombres_episodio_traducidos(
         client,
-        &opts.api_key,
+        b.api_key,
         series_id,
         ep.temporada,
         ep.episodio,
@@ -286,9 +305,9 @@ fn episodio_se_llama_traducido(
 
 /// ¿El mejor candidato basta para renombrar sin supervisión? Score por encima
 /// del umbral, de una variante fiable y sin empate.
-fn eleccion_firme(candidatos: &[Candidato], opts: &Opciones) -> bool {
+pub fn eleccion_firme(candidatos: &[Candidato], umbral: f64) -> bool {
     match candidatos.first() {
-        Some(mejor) => mejor.score >= opts.umbral && mejor.fiable && !hay_empate(candidatos),
+        Some(mejor) => mejor.score >= umbral && mejor.fiable && !hay_empate(candidatos),
         None => false,
     }
 }
@@ -384,6 +403,179 @@ enum Fallo {
     Definitivo(String),
 }
 
+/// Decide qué serie de TMDb es la del archivo, con toda la escalera de rescates
+/// (planes B-F). No mueve nada ni toca el disco: solo pregunta.
+///
+/// Devuelve los candidatos ya resueltos —una lista de uno cuando un desempate
+/// ha ganado— y la clave de caché bajo la que memorizar el acierto, que el plan
+/// B puede haber cambiado. Lista vacía significa que TMDb no encontró nada.
+///
+/// Vive aparte de `procesar_archivo` para que la app de escritorio decida igual
+/// que el servicio. La app tenía su propia versión sin ninguno de los planes y,
+/// lo que es peor, sin detectar empates: ante dos series llamadas exactamente
+/// igual renombraba con la más popular y sin avisar, mientras el servicio las
+/// mandaba a revisión.
+///
+/// `Err` es siempre un fallo de red: el archivo no se ha tocado y conviene
+/// reintentar, que no es lo mismo que no haber encontrado la serie.
+#[allow(clippy::too_many_arguments)]
+pub fn elegir_serie(
+    client: &Client,
+    b: Busqueda,
+    cache: &mut SeriesCache,
+    nombre: &str,
+    titulo: &str,
+    anio_archivo: Option<u32>,
+    ep: EpisodioInfo,
+    clave: String,
+) -> Result<(Vec<Candidato>, String), String> {
+    let candidatos =
+        match buscar_candidatos_serie(client, titulo, anio_archivo, b.api_key, b.idioma) {
+            Ok(c) => c,
+            Err(e) => return Err(e.to_string()),
+        };
+
+    // Plan B: el código de episodio puede partir el nombre de la serie por
+    // la mitad ("Star Trek 2x10 Strange New Worlds (2022)"), y entonces el
+    // prefijo solo es un título genérico que empata con media docena de
+    // series. Se reintenta con las dos mitades unidas. Solo entra cuando la
+    // primera búsqueda no ha convencido, así que no puede estropear ningún
+    // nombre que ya funcione: lo que hoy acaba en `_revisar` es lo único
+    // que cambia de desenlace, y quien decide sigue siendo TMDb.
+    let (candidatos, clave) = match eleccion_firme(&candidatos, b.umbral) {
+        true => (candidatos, clave),
+        false => match titulo_compuesto(nombre) {
+            Some((titulo2, anio2)) => {
+                let clave2 = clave_cache_titulo(&titulo2, anio2);
+                match buscar_candidatos_serie(
+                    client,
+                    &titulo2,
+                    anio2,
+                    b.api_key,
+                    b.idioma,
+                ) {
+                    Ok(c2) if eleccion_firme(&c2, b.umbral) => (c2, clave2),
+                    Ok(_) => (candidatos, clave),
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            None => (candidatos, clave),
+        },
+    };
+
+    // Plan C: exprimir el año que vive DETRÁS del código de episodio, que
+    // `extraer_info_archivo` descarta por si es el año de emisión del
+    // capítulo. En `Silo 3x07 Radio (2023)` es el año de la serie, y es lo
+    // único que separa a las dos series llamadas "Silo" (2023 y 2017), que
+    // empatan a 1.00 de similitud. Con el año, `tmdb` premia a una y
+    // penaliza a la otra, y el empate desaparece.
+    //
+    // La clave de caché NO se toca: se memoriza bajo el título sin año
+    // ("silo"), que es la clave que generan los demás episodios del lote
+    // aunque no traigan año en el nombre. Así el reintento se paga una vez.
+    let candidatos = match eleccion_firme(&candidatos, b.umbral) {
+        true => candidatos,
+        false => match anio_del_sufijo(nombre) {
+            Some(anio) => match buscar_candidatos_serie(
+                client,
+                titulo,
+                Some(anio),
+                b.api_key,
+                b.idioma,
+            ) {
+                Ok(c2) if eleccion_firme(&c2, b.umbral) => c2,
+                Ok(_) => candidatos,
+                Err(e) => return Err(e.to_string()),
+            },
+            None => candidatos,
+        },
+    };
+
+    if candidatos.is_empty() {
+        return Ok((candidatos, clave));
+    }
+
+    // Plan D: si sigue habiendo empate, que lo rompa el propio episodio.
+    // Es el último dato del nombre que nadie ha usado todavía y el más
+    // difícil de falsear: una serie homónima que no tiene esa temporada
+    // queda descartada sin depender de la popularidad.
+    let candidatos = match eleccion_firme(&candidatos, b.umbral) {
+        true => candidatos,
+        false => match desempatar_por_episodio(&candidatos, b.umbral, |id| {
+            serie_tiene_episodio(client, b, id, ep)
+        }) {
+            Ok(Some(ganador)) => vec![ganador],
+            Ok(None) => candidatos,
+            Err(e) => return Err(e),
+        },
+    };
+
+    // Plan E: cuando las dos homónimas tienen ese episodio, el plan D se
+    // queda sin argumentos y hay que mirar CÓMO se llama el capítulo.
+    // `Lucky 1x06` empata a 1.00 entre `Lucky` (2026) y `Lucky` (2007), y
+    // las dos tienen un 1x06, pero solo la de 2026 lo titula "Vayas donde
+    // vayas, siempre serás tú"; la de 2007 lo deja en "Episodio 6".
+    //
+    // Es el último dato del nombre que quedaba sin usar. Si el sufijo no
+    // era el título del capítulo sino ruido de release, no encaja con
+    // ningún candidato y el desempate se descarta sin efecto, igual que
+    // los planes B y C: esto solo puede rescatar lo que hoy va a
+    // `_revisar`, nunca estropear un nombre que ya funciona.
+    //
+    // Un sufijo sin palabras fuertes ("de la") daría cobertura 1.00 contra
+    // cualquier cosa: no distingue nada y solo gasta llamadas, así que los
+    // planes E y F lo descartan de entrada.
+    let titulo_ep = titulo_episodio(nombre).filter(|t| !palabras_fuertes(t).is_empty());
+    let candidatos = match eleccion_firme(&candidatos, b.umbral) {
+        true => candidatos,
+        false => match &titulo_ep {
+            Some(titulo_ep) => {
+                match desempatar_por_episodio(&candidatos, b.umbral, |id| {
+                    episodio_se_llama(client, b, cache, id, ep, titulo_ep)
+                }) {
+                    Ok(Some(ganador)) => vec![ganador],
+                    Ok(None) => candidatos,
+                    Err(e) => return Err(e),
+                }
+            }
+            None => candidatos,
+        },
+    };
+
+    // Plan F: el plan E pregunta el nombre del capítulo en el idioma
+    // configurado, y cuando TMDb no tiene esa traducción no contesta
+    // "no lo sé": rellena con un genérico ("Episodio 1") que puntúa igual
+    // contra las dos homónimas y por tanto no desempata nada. Las
+    // traducciones a OTROS idiomas sí traen el título de verdad.
+    //
+    // `Dalgliesh 1x03` empata a 1.00 entre `Dalgliesh` (2021) y `Dalgliesh`
+    // (1983), las dos con los seis capítulos de la T1 y las dos con
+    // "Episodio 3" en es-ES. En catalán, la de 2021 lo titula "La torre
+    // negra (1)", que es exactamente lo que dice el archivo.
+    //
+    // Comparar contra todos los idiomas es ruidoso —la serie equivocada
+    // llegó a 0.646 por parecido casual—, de ahí el umbral alto. El
+    // contrato es el de siempre: solo entra si la elección no es firme y
+    // solo gana si sobrevive exactamente un candidato.
+    let candidatos = match eleccion_firme(&candidatos, b.umbral) {
+        true => candidatos,
+        false => match &titulo_ep {
+            Some(titulo_ep) => {
+                match desempatar_por_episodio(&candidatos, b.umbral, |id| {
+                    episodio_se_llama_traducido(client, b, id, ep, titulo_ep)
+                }) {
+                    Ok(Some(ganador)) => vec![ganador],
+                    Ok(None) => candidatos,
+                    Err(e) => return Err(e),
+                }
+            }
+            None => candidatos,
+        },
+    };
+
+    Ok((candidatos, clave))
+}
+
 /// Procesa un único archivo de vídeo de principio a fin.
 pub fn procesar_archivo(
     client: &Client,
@@ -450,160 +642,29 @@ pub fn procesar_archivo(
             }
         }
 
-        let candidatos = match buscar_candidatos_serie(
+        let (candidatos, clave) = match elegir_serie(
             client,
+            opts.busqueda(),
+            cache,
+            &nombre,
             &titulo,
             anio_archivo,
-            &opts.api_key,
-            opts.idioma,
+            ep,
+            clave,
         ) {
-            Ok(c) => c,
-            Err(e) => return Resultado::ErrorRed(e.to_string()),
-        };
-
-        // Plan B: el código de episodio puede partir el nombre de la serie por
-        // la mitad ("Star Trek 2x10 Strange New Worlds (2022)"), y entonces el
-        // prefijo solo es un título genérico que empata con media docena de
-        // series. Se reintenta con las dos mitades unidas. Solo entra cuando la
-        // primera búsqueda no ha convencido, así que no puede estropear ningún
-        // nombre que ya funcione: lo que hoy acaba en `_revisar` es lo único
-        // que cambia de desenlace, y quien decide sigue siendo TMDb.
-        let (candidatos, clave) = match eleccion_firme(&candidatos, opts) {
-            true => (candidatos, clave),
-            false => match titulo_compuesto(&nombre) {
-                Some((titulo2, anio2)) => {
-                    let clave2 = clave_cache_titulo(&titulo2, anio2);
-                    match buscar_candidatos_serie(
-                        client,
-                        &titulo2,
-                        anio2,
-                        &opts.api_key,
-                        opts.idioma,
-                    ) {
-                        Ok(c2) if eleccion_firme(&c2, opts) => (c2, clave2),
-                        Ok(_) => (candidatos, clave),
-                        Err(e) => return Resultado::ErrorRed(e.to_string()),
-                    }
-                }
-                None => (candidatos, clave),
-            },
-        };
-
-        // Plan C: exprimir el año que vive DETRÁS del código de episodio, que
-        // `extraer_info_archivo` descarta por si es el año de emisión del
-        // capítulo. En `Silo 3x07 Radio (2023)` es el año de la serie, y es lo
-        // único que separa a las dos series llamadas "Silo" (2023 y 2017), que
-        // empatan a 1.00 de similitud. Con el año, `tmdb` premia a una y
-        // penaliza a la otra, y el empate desaparece.
-        //
-        // La clave de caché NO se toca: se memoriza bajo el título sin año
-        // ("silo"), que es la clave que generan los demás episodios del lote
-        // aunque no traigan año en el nombre. Así el reintento se paga una vez.
-        let candidatos = match eleccion_firme(&candidatos, opts) {
-            true => candidatos,
-            false => match anio_del_sufijo(&nombre) {
-                Some(anio) => match buscar_candidatos_serie(
-                    client,
-                    &titulo,
-                    Some(anio),
-                    &opts.api_key,
-                    opts.idioma,
-                ) {
-                    Ok(c2) if eleccion_firme(&c2, opts) => c2,
-                    Ok(_) => candidatos,
-                    Err(e) => return Resultado::ErrorRed(e.to_string()),
-                },
-                None => candidatos,
-            },
+            Ok(v) => v,
+            Err(e) => return Resultado::ErrorRed(e),
         };
 
         if candidatos.is_empty() {
             return manejar_dudoso(opts, path, "sin resultados en TMDb");
         }
 
-        // Plan D: si sigue habiendo empate, que lo rompa el propio episodio.
-        // Es el último dato del nombre que nadie ha usado todavía y el más
-        // difícil de falsear: una serie homónima que no tiene esa temporada
-        // queda descartada sin depender de la popularidad.
-        let candidatos = match eleccion_firme(&candidatos, opts) {
-            true => candidatos,
-            false => match desempatar_por_episodio(&candidatos, opts.umbral, |id| {
-                serie_tiene_episodio(client, opts, id, ep)
-            }) {
-                Ok(Some(ganador)) => vec![ganador],
-                Ok(None) => candidatos,
-                Err(e) => return Resultado::ErrorRed(e),
-            },
-        };
-
-        // Plan E: cuando las dos homónimas tienen ese episodio, el plan D se
-        // queda sin argumentos y hay que mirar CÓMO se llama el capítulo.
-        // `Lucky 1x06` empata a 1.00 entre `Lucky` (2026) y `Lucky` (2007), y
-        // las dos tienen un 1x06, pero solo la de 2026 lo titula "Vayas donde
-        // vayas, siempre serás tú"; la de 2007 lo deja en "Episodio 6".
-        //
-        // Es el último dato del nombre que quedaba sin usar. Si el sufijo no
-        // era el título del capítulo sino ruido de release, no encaja con
-        // ningún candidato y el desempate se descarta sin efecto, igual que
-        // los planes B y C: esto solo puede rescatar lo que hoy va a
-        // `_revisar`, nunca estropear un nombre que ya funciona.
-        //
-        // Un sufijo sin palabras fuertes ("de la") daría cobertura 1.00 contra
-        // cualquier cosa: no distingue nada y solo gasta llamadas, así que los
-        // planes E y F lo descartan de entrada.
-        let titulo_ep = titulo_episodio(&nombre).filter(|t| !palabras_fuertes(t).is_empty());
-        let candidatos = match eleccion_firme(&candidatos, opts) {
-            true => candidatos,
-            false => match &titulo_ep {
-                Some(titulo_ep) => {
-                    match desempatar_por_episodio(&candidatos, opts.umbral, |id| {
-                        episodio_se_llama(client, opts, cache, id, ep, titulo_ep)
-                    }) {
-                        Ok(Some(ganador)) => vec![ganador],
-                        Ok(None) => candidatos,
-                        Err(e) => return Resultado::ErrorRed(e),
-                    }
-                }
-                None => candidatos,
-            },
-        };
-
-        // Plan F: el plan E pregunta el nombre del capítulo en el idioma
-        // configurado, y cuando TMDb no tiene esa traducción no contesta
-        // "no lo sé": rellena con un genérico ("Episodio 1") que puntúa igual
-        // contra las dos homónimas y por tanto no desempata nada. Las
-        // traducciones a OTROS idiomas sí traen el título de verdad.
-        //
-        // `Dalgliesh 1x03` empata a 1.00 entre `Dalgliesh` (2021) y `Dalgliesh`
-        // (1983), las dos con los seis capítulos de la T1 y las dos con
-        // "Episodio 3" en es-ES. En catalán, la de 2021 lo titula "La torre
-        // negra (1)", que es exactamente lo que dice el archivo.
-        //
-        // Comparar contra todos los idiomas es ruidoso —la serie equivocada
-        // llegó a 0.646 por parecido casual—, de ahí el umbral alto. El
-        // contrato es el de siempre: solo entra si la elección no es firme y
-        // solo gana si sobrevive exactamente un candidato.
-        let candidatos = match eleccion_firme(&candidatos, opts) {
-            true => candidatos,
-            false => match &titulo_ep {
-                Some(titulo_ep) => {
-                    match desempatar_por_episodio(&candidatos, opts.umbral, |id| {
-                        episodio_se_llama_traducido(client, opts, id, ep, titulo_ep)
-                    }) {
-                        Ok(Some(ganador)) => vec![ganador],
-                        Ok(None) => candidatos,
-                        Err(e) => return Resultado::ErrorRed(e),
-                    }
-                }
-                None => candidatos,
-            },
-        };
-
         let mejor = &candidatos[0];
         // Un candidato de variante desesperada nunca auto-renombra por score.
         // Un empate tampoco: ver `hay_empate`.
         let empate = hay_empate(&candidatos);
-        let confiado = eleccion_firme(&candidatos, opts);
+        let confiado = eleccion_firme(&candidatos, opts.umbral);
         if confiado || opts.accion_dudoso == AccionDudoso::Forzar {
             // Solo se memoriza una identificación firme: cachear un empate
             // propagaría el error a todos los episodios del lote y lo dejaría
@@ -754,7 +815,7 @@ fn obtener_info_serie(
 /// El sufijo del archivo se criba igual que en los planes E y F: sin palabras
 /// fuertes es ruido de release y no titula nada. Si no hay nada mejor, se
 /// conserva el relleno de TMDb antes que quedarse sin título.
-fn titulo_de_capitulo(
+pub fn titulo_de_capitulo(
     nombre_tmdb: Option<String>,
     path: &Path,
     ep: EpisodioInfo,
@@ -780,7 +841,8 @@ fn construir_y_mover_serie(
     ext: &str,
 ) -> Result<String, Fallo> {
     let (titulo_serie, anio) = obtener_info_serie(client, opts, cache, series_id)?;
-    let nombre_ep = nombre_de_episodio(client, opts, cache, series_id, ep).map_err(Fallo::Red)?;
+    let nombre_ep = nombre_de_episodio(client, opts.busqueda(), cache, series_id, ep)
+        .map_err(Fallo::Red)?;
 
     let titulo_limpio = limpiar_nombre_archivo(&titulo_serie);
     let codigo = codigo_episodio(opts, ep);
