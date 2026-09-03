@@ -17,7 +17,9 @@ use walkdir::WalkDir;
 
 use renombrador::cache::SeriesCache;
 use renombrador::config::Idioma;
-use renombrador::mover::{borrar_dir_vacio_bajo, crear_dirs, descripcion_permisos};
+use renombrador::mover::{
+    borrar_dir_vacio_bajo, crear_dirs, descripcion_permisos, identidad_efectiva, se_puede_escribir,
+};
 use renombrador::organizer::{procesar_archivo, AccionDudoso, Opciones, Resultado};
 use renombrador::EXTENSIONES_VALIDAS;
 
@@ -198,6 +200,20 @@ fn banner(env: &Entorno) {
         ),
     );
     log("INFO", format!("  Colecciones:    {}", o.usar_colecciones));
+    if let Some((uid, gid)) = identidad_efectiva() {
+        // Con qué dueño sale lo que depositamos. Es la primera pregunta ante
+        // una biblioteca llena de archivos de `root`, y hasta ahora había que
+        // deducirla mirando el resultado.
+        log(
+            "INFO",
+            format!(
+                "  Usuario:        uid={} gid={}{}",
+                uid,
+                gid,
+                if uid == 0 { " (root)" } else { "" }
+            ),
+        );
+    }
     if let Some(permisos) = descripcion_permisos() {
         log("INFO", format!("  Permisos:       {}", permisos));
     }
@@ -262,6 +278,35 @@ fn main() {
     }
 
     banner(&env);
+
+    // Cada montaje que necesitamos, probado escribiendo de verdad. Correr sin
+    // permiso de escritura no aborta —los demás montajes pueden estar bien—,
+    // pero tiene que verse: el caché en particular falla en silencio, y sin él
+    // el servicio vuelve a preguntarle a TMDb por una serie que ya resolvió.
+    let cache_dir = env
+        .cache_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    for (etiqueta, dir) in [
+        ("descargas", &env.watch_dir),
+        ("películas", &env.opts.dir_peliculas),
+        ("series", &env.opts.dir_series),
+        ("revisar", &env.opts.dir_revisar),
+        ("caché", &cache_dir),
+    ] {
+        if !se_puede_escribir(dir) {
+            log(
+                "WARN",
+                format!(
+                    "sin permiso de escritura en {} ('{}'): revisa el dueño del montaje o el `user:` del contenedor",
+                    etiqueta,
+                    dir.display()
+                ),
+            );
+        }
+    }
 
     let client = match Client::builder()
         .timeout(Duration::from_secs(30))

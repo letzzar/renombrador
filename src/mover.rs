@@ -4,23 +4,30 @@ use std::fs;
 use std::path::Path;
 
 /// Ajuste de permisos y propietario del resultado final. Solo tiene efecto en
-/// Unix.
+/// Unix. Modo, dueño y grupo van siempre juntos: aquí "permisos" son los tres.
 ///
-/// `fs::rename` conserva el modo y el dueño del archivo de origen, y `fs::copy`
-/// se trae el modo, así que sin esto un archivo que llega a descargas en `600`
-/// (o peor, `000`) se deposita igual en la carpeta de series o películas. Da
-/// igual mientras quien reproduce es el propietario, pero rompe cualquier
-/// consumidor que llegue por NFS o desde un contenedor con otro UID, que solo
-/// puede apoyarse en los bits de "otros".
+/// **Manda el origen; el destino solo corrige lo que choca.** El archivo venía
+/// de una carpeta de descargas que el usuario ya usa, así que sus permisos son
+/// casi siempre los buenos, y renombrarlo no es motivo para cambiárselos. Lo
+/// que se corrige es solo lo que la biblioteca no aceptaría:
 ///
-/// **No hay modo por defecto**: lo que se deposita se pone al nivel de la
-/// biblioteca a la que llega. La referencia es el directorio de destino —el
-/// primer nivel que ya existe bajo `/series` o `/peliculas`—, del que se copian
-/// modo y `uid:gid`. Un archivo sale con los mismos permisos que sus vecinos y
-/// con el dueño de la carpeta que lo acoge, así que el resultado es
-/// indistinguible del contenido que ya se reproduce bien. Deliberadamente NO se
-/// hereda del origen: el archivo de descargas es justo el que llega en `000`.
-/// `FILE_MODE`/`DIR_MODE`/`PUID`/`PGID` sobreescriben lo que haga falta.
+/// - **Dueño y grupo**: si la biblioteca tiene dueño conocido, manda ella —su
+///   contenido es de quien la posee—. Si no se pudo leer, se conservan los del
+///   origen.
+/// - **Modo**: se conserva el del origen, ensanchado hasta lo que la biblioteca
+///   deja a grupo y otros. Nunca se recorta: un archivo más abierto que su
+///   carpeta no rompe nada (la carpeta ya decide quién entra), pero uno más
+///   cerrado deja de reproducirse por NFS o desde otro contenedor.
+///
+/// Hubo un intento anterior de tomarlo **todo** del destino y no mirar el
+/// origen, por un `000` que se atribuyó a los archivos de descargas. El `000`
+/// era del destino: una `_revisar` con ACL de Synology, donde los bits POSIX se
+/// leen a cero. Ignorar el origen no arreglaba aquello y sí perdía lo que sí
+/// estaba bien — en la copia entre montajes, el dueño se perdía entero y todo
+/// acababa en `root`.
+///
+/// `FILE_MODE`/`DIR_MODE`/`PUID`/`PGID` sobreescriben cualquiera de las dos
+/// mitades.
 #[cfg(unix)]
 mod permisos {
     use std::fs;
@@ -138,8 +145,13 @@ where
 /// que la estructura queda vacía y todo su uso se compila a nada.
 #[derive(Clone, Copy, Default)]
 pub struct Herencia {
+    /// `FILE_MODE`: si está puesto, es el modo final y no se mira el origen.
     #[cfg(unix)]
-    modo_archivo: Option<u32>,
+    modo_archivo_forzado: Option<u32>,
+    /// Lo que la biblioteca deja como mínimo a grupo y otros. No sustituye al
+    /// modo del origen: lo ensancha.
+    #[cfg(unix)]
+    modo_archivo_minimo: Option<u32>,
     #[cfg(unix)]
     modo_dir: Option<u32>,
     #[cfg(unix)]
@@ -148,18 +160,53 @@ pub struct Herencia {
     gid: Option<u32>,
 }
 
+/// Lo que el archivo de origen trae puesto y hay que conservarle. Vacío en
+/// plataformas sin permisos POSIX.
+#[derive(Clone, Copy, Default)]
+pub struct Origen {
+    #[cfg(unix)]
+    modo: Option<u32>,
+    #[cfg(unix)]
+    uid: Option<u32>,
+    #[cfg(unix)]
+    gid: Option<u32>,
+}
+
+impl Origen {
+    /// Se lee **antes** de mover nada: en cuanto el archivo cambia de sitio (o
+    /// se copia, que lo deja del dueño del proceso) ya no se puede preguntar.
+    #[cfg(unix)]
+    pub fn de(ruta: &Path) -> Self {
+        match permisos::estado_de(ruta) {
+            Some((m, u, g, _)) => Self {
+                modo: Some(m),
+                uid: Some(u),
+                gid: Some(g),
+            },
+            None => Self::default(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn de(_ruta: &Path) -> Self {
+        Self::default()
+    }
+}
+
 impl Herencia {
     /// Toma como referencia el primer ancestro de `destino` que ya existe
     /// (`destino` mismo si existe): la carpeta de la biblioteca en la que
     /// aterriza el archivo.
     ///
     /// - Los directorios nuevos copian su modo tal cual, bits setgid incluidos
-    ///   (un `2775` en la raíz de la biblioteca debe seguir propagándose).
-    /// - Los archivos copian solo los bits de lectura y escritura (`& 0o666`):
-    ///   un `.mkv` no es ejecutable, y setuid/setgid en un archivo significan
-    ///   algo muy distinto que en una carpeta.
-    /// - `uid`/`gid` salen de esa misma carpeta, para que el archivo quede del
-    ///   mismo dueño y grupo que el resto de la biblioteca.
+    ///   (un `2775` en la raíz de la biblioteca debe seguir propagándose). Los
+    ///   creamos nosotros, así que no hay origen que conservarles.
+    /// - De los archivos solo sale el **mínimo** de lectura y escritura
+    ///   (`& 0o666`), que se suma al modo del origen: un `.mkv` no es
+    ///   ejecutable, y setuid/setgid en un archivo significan algo muy distinto
+    ///   que en una carpeta.
+    /// - `uid`/`gid` salen de esa misma carpeta y **sustituyen** a los del
+    ///   origen: el contenido de una biblioteca es de quien la posee.
     ///
     /// Un nivel **sin ningún bit de lectura** (`000`, `--x--x--x`) no se acepta
     /// como referencia y se sigue subiendo. No es una carpeta "muy cerrada" de
@@ -196,7 +243,8 @@ impl Herencia {
         };
 
         Self {
-            modo_archivo: modo_archivo_env.or(modo.map(|m| m & 0o666)),
+            modo_archivo_forzado: modo_archivo_env,
+            modo_archivo_minimo: modo.map(|m| m & 0o666),
             modo_dir: modo_dir_env.or(modo),
             uid: uid_env.or(uid),
             gid: gid_env.or(gid),
@@ -206,6 +254,31 @@ impl Herencia {
     #[cfg(not(unix))]
     pub fn del_destino(_destino: &Path) -> Self {
         Self::default()
+    }
+
+    /// Modo, dueño y grupo con los que se deposita un archivo concreto: los
+    /// suyos de origen, corregidos donde chocan con la biblioteca.
+    ///
+    /// El modo se **ensancha**, nunca se recorta. El dueño y el grupo sí se
+    /// sustituyen cuando la biblioteca los tiene: un archivo que conserva su
+    /// dueño de descargas dentro de una biblioteca ajena es justo lo que deja
+    /// una carpeta llena de dueños distintos.
+    ///
+    /// `None` en cualquiera de los tres significa "no tocar eso", que es
+    /// preferible a inventarse un valor: sin origen legible ni referencia
+    /// válida, lo que haya puesto el sistema de archivos (o la ACL del recurso)
+    /// se queda como está.
+    #[cfg(unix)]
+    fn para_archivo(&self, origen: Origen) -> (Option<u32>, Option<u32>, Option<u32>) {
+        let modo = match self.modo_archivo_forzado {
+            Some(forzado) => Some(forzado),
+            None => match (origen.modo.map(|m| m & 0o666), self.modo_archivo_minimo) {
+                (Some(o), Some(m)) => Some(o | m),
+                (Some(o), None) => Some(o),
+                (None, m) => m,
+            },
+        };
+        (modo, self.uid.or(origen.uid), self.gid.or(origen.gid))
     }
 }
 
@@ -243,14 +316,54 @@ pub fn descripcion_permisos() -> Option<String> {
     None
 }
 
-/// Deja el archivo con los permisos y el dueño del directorio de destino.
+/// `uid:gid` con el que este proceso deja lo que crea.
+///
+/// La librería estándar no expone `getuid`, así que se le pregunta al sistema
+/// de archivos: se crea un archivo en el temporal y se mira de quién sale. Es
+/// además la respuesta que importa —la que van a tener los archivos que
+/// depositemos— y no la que diría una llamada al sistema.
 #[cfg(unix)]
-fn normalizar_archivo(ruta: &Path, h: Herencia) {
-    permisos::aplicar(ruta, h.modo_archivo, h.uid, h.gid);
+pub fn identidad_efectiva() -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let sonda = std::env::temp_dir().join(format!("renombrador-id-{}", std::process::id()));
+    let meta = fs::File::create(&sonda)
+        .ok()
+        .and_then(|_| fs::metadata(&sonda).ok());
+    let _ = fs::remove_file(&sonda);
+    meta.map(|m| (m.uid(), m.gid()))
 }
 
 #[cfg(not(unix))]
-fn normalizar_archivo(_ruta: &Path, _h: Herencia) {}
+pub fn identidad_efectiva() -> Option<(u32, u32)> {
+    None
+}
+
+/// ¿Se puede escribir de verdad en `dir`?
+///
+/// Mirar los bits de permiso no responde a esta pregunta en un NAS: con una ACL
+/// de por medio dicen una cosa y el kernel decide otra. Se comprueba creando y
+/// borrando un archivo, que es lo único que no miente.
+pub fn se_puede_escribir(dir: &Path) -> bool {
+    let sonda = dir.join(format!(".renombrador-escritura-{}", std::process::id()));
+    match fs::File::create(&sonda) {
+        Ok(_) => {
+            let _ = fs::remove_file(&sonda);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Deja el archivo con lo que traía de origen, corregido donde choca con el
+/// directorio de destino.
+#[cfg(unix)]
+fn normalizar_archivo(ruta: &Path, h: Herencia, origen: Origen) {
+    let (modo, uid, gid) = h.para_archivo(origen);
+    permisos::aplicar(ruta, modo, uid, gid);
+}
+
+#[cfg(not(unix))]
+fn normalizar_archivo(_ruta: &Path, _h: Herencia, _origen: Origen) {}
 
 /// Deja el directorio con los permisos y el dueño del nivel del que cuelga.
 #[cfg(unix)]
@@ -326,6 +439,10 @@ pub fn mover_seguro(origen: &Path, destino: &Path) -> Result<(), String> {
     // carpeta recién hecha (con la umask del proceso) en vez de la raíz de la
     // biblioteca, y estaríamos heredando de nosotros mismos.
     let herencia = Herencia::del_destino(destino);
+    // Y el origen se lee antes de tocarlo: después de un `rename` ya no está
+    // ahí, y una `copy` deja el resultado del dueño del proceso (nosotros,
+    // `root`) sin dejar rastro de quién era.
+    let origen_previo = Origen::de(origen);
 
     if let Some(padre) = destino.parent() {
         crear_dirs_con(padre, herencia)
@@ -350,7 +467,7 @@ pub fn mover_seguro(origen: &Path, destino: &Path) -> Result<(), String> {
     // Primero intentamos un rename (rápido, atómico). Si falla —probablemente
     // por estar en otro sistema de archivos— copiamos y borramos el origen.
     if fs::rename(origen, destino).is_ok() {
-        normalizar_archivo(destino, herencia);
+        normalizar_archivo(destino, herencia, origen_previo);
         return Ok(());
     }
 
@@ -372,7 +489,7 @@ pub fn mover_seguro(origen: &Path, destino: &Path) -> Result<(), String> {
     // Ajustamos permisos y propietario sobre el `.part`, antes del rename
     // final: así el archivo nunca llega a existir con su nombre definitivo y
     // permisos malos, y un escaneo de la biblioteca no puede pillarlo así.
-    normalizar_archivo(&tmp, herencia);
+    normalizar_archivo(&tmp, herencia, origen_previo);
     fs::rename(&tmp, destino).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("error al renombrar '{}' a su nombre final: {}", tmp.display(), e)
@@ -615,9 +732,9 @@ mod tests {
         let h = Herencia::del_destino(&revisar.join("descarga.mkv"));
 
         assert_eq!(
-            h.modo_archivo,
+            h.modo_archivo_minimo,
             Some(0o664),
-            "hereda de descargas (0o775 & 0o666), no el 000 de _revisar"
+            "el mínimo sale de descargas (0o775 & 0o666), no del 000 de _revisar"
         );
         assert_eq!(h.modo_dir, Some(0o775));
         assert_eq!(
@@ -666,26 +783,94 @@ mod tests {
     /// Y sin referencia no se toca nada: es preferible dejar que la ACL del
     /// recurso propague lo suyo a imponer el `root:root 755` de la raíz del
     /// contenedor (que además borra la ACL al hacer el chmod).
+    /// Sin biblioteca de la que aprender, el archivo se queda tal y como venía:
+    /// no se le impone nada, que es lo contrario de lo que pasaba cuando la
+    /// referencia se escapaba a la raíz del contenedor.
     #[test]
-    fn sin_referencia_valida_no_se_aplica_ningun_permiso() {
-        let h = Herencia {
-            modo_archivo: None,
-            modo_dir: None,
-            uid: None,
-            gid: None,
-        };
-        // `aplicar` con todo a None no debe tocar el archivo.
+    fn sin_referencia_valida_el_archivo_conserva_lo_suyo() {
+        let sin_biblioteca = Herencia::default();
         let raiz = caja("sin-referencia");
         let f = raiz.join("x.mkv");
         fs::write(&f, b"video").unwrap();
         fs::set_permissions(&f, fs::Permissions::from_mode(0o604)).unwrap();
         let antes = duenio(&f);
+        let origen = Origen::de(&f);
 
-        normalizar_archivo(&f, h);
+        normalizar_archivo(&f, sin_biblioteca, origen);
 
-        assert_eq!(modo(&f), 0o604, "sin modo que aplicar, no se toca");
-        assert_eq!(duenio(&f), antes, "sin uid/gid que aplicar, tampoco");
+        assert_eq!(modo(&f), 0o604, "el modo del origen, intacto");
+        assert_eq!(duenio(&f), antes, "y su dueño y grupo también");
         let _ = fs::remove_dir_all(&raiz);
+    }
+
+    /// El corazón del modelo: se parte de lo que traía el archivo y la
+    /// biblioteca solo corrige lo que choca. El modo se ensancha hasta lo que
+    /// ella deja, nunca se recorta; el dueño y el grupo sí los sustituye.
+    #[test]
+    fn el_origen_manda_y_la_biblioteca_solo_ensancha() {
+        let biblioteca = Herencia {
+            modo_archivo_forzado: None,
+            modo_archivo_minimo: Some(0o664),
+            modo_dir: Some(0o775),
+            uid: Some(1026),
+            gid: Some(100),
+        };
+
+        // Un archivo más cerrado que la biblioteca: se abre hasta ella.
+        let cerrado = Origen {
+            modo: Some(0o600),
+            uid: Some(0),
+            gid: Some(0),
+        };
+        assert_eq!(
+            biblioteca.para_archivo(cerrado),
+            (Some(0o664), Some(1026), Some(100))
+        );
+
+        // Uno más abierto: se respeta, no se recorta.
+        let abierto = Origen {
+            modo: Some(0o666),
+            uid: Some(1026),
+            gid: Some(100),
+        };
+        assert_eq!(
+            biblioteca.para_archivo(abierto),
+            (Some(0o666), Some(1026), Some(100))
+        );
+
+        // Y sin dueño conocido en la biblioteca, el del origen se conserva:
+        // es justo lo que la copia entre montajes perdía.
+        let sin_duenio = Herencia {
+            uid: None,
+            gid: None,
+            ..biblioteca
+        };
+        assert_eq!(
+            sin_duenio.para_archivo(abierto),
+            (Some(0o666), Some(1026), Some(100))
+        );
+    }
+
+    /// `FILE_MODE` es un modo final, no un mínimo: cuando está puesto, ni el
+    /// origen ni la biblioteca opinan.
+    #[test]
+    fn el_modo_forzado_no_se_mezcla_con_el_del_origen() {
+        let forzado = Herencia {
+            modo_archivo_forzado: Some(0o640),
+            modo_archivo_minimo: Some(0o666),
+            modo_dir: None,
+            uid: None,
+            gid: None,
+        };
+        let origen = Origen {
+            modo: Some(0o666),
+            uid: Some(7),
+            gid: Some(7),
+        };
+        assert_eq!(
+            forzado.para_archivo(origen),
+            (Some(0o640), Some(7), Some(7))
+        );
     }
 
     /// El nivel bueno sigue ganando cuando lo hay: si `/series` fuese legible,
@@ -708,6 +893,12 @@ mod tests {
 
     /// Una carpeta cerrada pero legible por su dueño sigue siendo referencia
     /// válida: solo se descarta la que no deja leer a nadie.
+    ///
+    /// Y aquí se ve que la biblioteca **ensancha pero no recorta**: la carpeta
+    /// es `700`, el archivo llegó en `644` y sale en `644`. No se le quitan los
+    /// bits de lectura que ya traía porque la carpeta sea privada: quien no
+    /// pueda entrar en un `700` no llega al archivo de todas formas, y recortar
+    /// es como se rompen las reproducciones por NFS.
     #[test]
     fn una_carpeta_privada_pero_legible_si_vale_de_referencia() {
         let raiz = caja("privada");
@@ -715,11 +906,16 @@ mod tests {
 
         let origen = std::env::temp_dir().join(format!("origen-priv-{}.mkv", std::process::id()));
         fs::write(&origen, b"video").unwrap();
+        fs::set_permissions(&origen, fs::Permissions::from_mode(0o644)).unwrap();
 
         let destino = raiz.join("x.mkv");
         mover_seguro(&origen, &destino).unwrap();
 
-        assert_eq!(modo(&destino), 0o600, "0o700 & 0o666");
+        assert_eq!(
+            modo(&destino),
+            0o644,
+            "el 644 del origen, no el 600 que daría la carpeta"
+        );
         let _ = fs::remove_dir_all(&raiz);
     }
 
