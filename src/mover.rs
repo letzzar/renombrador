@@ -62,11 +62,13 @@ mod permisos {
         *F.get_or_init(|| (id_env("PUID"), id_env("PGID")))
     }
 
-    /// Modo y propietario de `ruta`, si se puede leer su metadata.
-    pub fn estado_de(ruta: &Path) -> Option<(u32, u32, u32)> {
+    /// Modo, propietario y **dispositivo** de `ruta`, si se puede leer su
+    /// metadata. El dispositivo delata dónde acaba el montaje de la
+    /// biblioteca: ver `Herencia::del_destino`.
+    pub fn estado_de(ruta: &Path) -> Option<(u32, u32, u32, u64)> {
         fs::metadata(ruta)
             .ok()
-            .map(|m| (m.mode() & 0o7777, m.uid(), m.gid()))
+            .map(|m| (m.mode() & 0o7777, m.uid(), m.gid(), m.dev()))
     }
 
     /// Aplica propietario y modo a `ruta`. Cada mitad es opcional: sin dato que
@@ -84,6 +86,45 @@ mod permisos {
         }
         if let Some(modo) = modo {
             let _ = fs::set_permissions(ruta, fs::Permissions::from_mode(modo));
+        }
+    }
+}
+
+/// Sube por los ancestros de `destino` buscando el nivel que sirve de
+/// referencia: el primero que existe, con algún bit de lectura y **dentro del
+/// mismo sistema de archivos** que el primer nivel existente.
+///
+/// `estado` se inyecta —igual que en los desempates de `organizer`— para poder
+/// probar el límite de montaje sin montar nada: en un test no hay forma de
+/// fabricar un padre en otro sistema de archivos sin ser root.
+#[cfg(unix)]
+fn referencia_para<F>(destino: &Path, mut estado: F) -> Option<(u32, u32, u32, u64)>
+where
+    F: FnMut(&Path) -> Option<(u32, u32, u32, u64)>,
+{
+    let mut referencia = Some(destino);
+    // Dispositivo del primer nivel que existe: el de la biblioteca.
+    let mut dispositivo: Option<u64> = None;
+    loop {
+        let r = referencia?;
+        if r.as_os_str().is_empty() {
+            return None;
+        }
+        match estado(r) {
+            Some(e) => {
+                if *dispositivo.get_or_insert(e.3) != e.3 {
+                    // Hemos salido del montaje: ahí fuera ya no hay nada que
+                    // podamos llamar "los permisos de la biblioteca".
+                    return None;
+                }
+                if e.0 & 0o444 != 0 {
+                    return Some(e);
+                }
+                // Existe pero no sirve de referencia: seguir subiendo.
+                referencia = r.parent();
+            }
+            // No existe todavía: es un nivel que vamos a crear nosotros.
+            None => referencia = r.parent(),
         }
     }
 }
@@ -129,28 +170,28 @@ impl Herencia {
     /// `_revisar` heredada de una versión antigua envenenaba todo lo que caía
     /// dentro. Su `uid:gid` tampoco vale (aparecía como `letzzar:root`), así
     /// que se descarta el nivel entero, no solo el modo.
+    ///
+    /// Esa subida **no sale nunca del montaje de la biblioteca**, y el tope es
+    /// el número de dispositivo del primer nivel que existe. Sin ese tope, un
+    /// `/series` ilegible llevaba la referencia hasta `/`, la raíz del propio
+    /// contenedor, que es `root:root 755`: de ahí salió `Dalgliesh (2021)` en
+    /// `drwxr-xr-x root root` con sus seis capítulos en `-rw-r--r-- root root`,
+    /// en una biblioteca donde todo lo demás es `letzzar:users`. Y encima ese
+    /// `chmod` se lleva por delante la ACL que el recurso propaga solo (el `+`
+    /// de `ls -l`), que es donde vivía el acceso de verdad.
+    ///
+    /// Sin referencia válida dentro del montaje no se aplica nada: es mejor
+    /// dejar que la ACL del recurso haga su trabajo que imponer los permisos de
+    /// un sistema de archivos que no tiene nada que ver. Para fijarlos a mano
+    /// están `PUID`/`PGID`/`FILE_MODE`/`DIR_MODE`, que van por delante de todo
+    /// esto.
     #[cfg(unix)]
     pub fn del_destino(destino: &Path) -> Self {
         let (modo_archivo_env, modo_dir_env) = permisos::modos_forzados();
         let (uid_env, gid_env) = permisos::ids_forzados();
 
-        let mut referencia = Some(destino);
-        let estado = loop {
-            let Some(r) = referencia else { break None };
-            if r.as_os_str().is_empty() {
-                break None;
-            }
-            match permisos::estado_de(r) {
-                Some(estado) if estado.0 & 0o444 != 0 => break Some(estado),
-                // Existe pero no sirve de referencia: seguir subiendo.
-                Some(_) => referencia = r.parent(),
-                // No existe todavía: es un nivel que vamos a crear nosotros.
-                None => referencia = r.parent(),
-            }
-        };
-
-        let (modo, uid, gid) = match estado {
-            Some((m, u, g)) => (Some(m), Some(u), Some(g)),
+        let (modo, uid, gid) = match referencia_para(destino, permisos::estado_de) {
+            Some((m, u, g, _)) => (Some(m), Some(u), Some(g)),
             None => (None, None, None),
         };
 
@@ -593,6 +634,76 @@ mod tests {
         // Hay que poder volver a entrar para limpiar.
         fs::set_permissions(&revisar, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&raiz);
+    }
+
+    /// Los dos sistemas de archivos que ve el contenedor: el bind-mount de la
+    /// biblioteca y la raíz del propio contenedor, que no tienen nada que ver.
+    const DEV_BIBLIOTECA: u64 = 42;
+    const DEV_RAIZ_CONTENEDOR: u64 = 1;
+
+    /// El árbol real del contenedor el 03-09-2026: `/series` es el recurso del
+    /// NAS, con ACL, y por eso sus bits POSIX están a cero; `/` es la raíz del
+    /// contenedor, en otro sistema de archivos y con otro dueño.
+    fn arbol_del_contenedor(p: &Path) -> Option<(u32, u32, u32, u64)> {
+        match p.to_str().unwrap() {
+            "/series" => Some((0o000, 1026, 100, DEV_BIBLIOTECA)),
+            "/" => Some((0o755, 0, 0, DEV_RAIZ_CONTENEDOR)),
+            // Todo lo que cuelga de /series aún no existe: lo creamos nosotros.
+            _ => None,
+        }
+    }
+
+    /// El bug del 03-09-2026: `/series` no vale de referencia (ACL, bits a
+    /// cero) y la subida seguía hasta `/`, la raíz del contenedor, de donde
+    /// salieron `Dalgliesh (2021)` y sus seis capítulos en `root:root`. La
+    /// biblioteca acaba en su montaje: fuera no se aprende nada.
+    #[test]
+    fn la_referencia_no_sale_del_montaje_de_la_biblioteca() {
+        let destino = Path::new("/series/Dalgliesh (2021)/Season 01/Dalgliesh 1x01.mkv");
+        assert_eq!(referencia_para(destino, arbol_del_contenedor), None);
+    }
+
+    /// Y sin referencia no se toca nada: es preferible dejar que la ACL del
+    /// recurso propague lo suyo a imponer el `root:root 755` de la raíz del
+    /// contenedor (que además borra la ACL al hacer el chmod).
+    #[test]
+    fn sin_referencia_valida_no_se_aplica_ningun_permiso() {
+        let h = Herencia {
+            modo_archivo: None,
+            modo_dir: None,
+            uid: None,
+            gid: None,
+        };
+        // `aplicar` con todo a None no debe tocar el archivo.
+        let raiz = caja("sin-referencia");
+        let f = raiz.join("x.mkv");
+        fs::write(&f, b"video").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o604)).unwrap();
+        let antes = duenio(&f);
+
+        normalizar_archivo(&f, h);
+
+        assert_eq!(modo(&f), 0o604, "sin modo que aplicar, no se toca");
+        assert_eq!(duenio(&f), antes, "sin uid/gid que aplicar, tampoco");
+        let _ = fs::remove_dir_all(&raiz);
+    }
+
+    /// El nivel bueno sigue ganando cuando lo hay: si `/series` fuese legible,
+    /// es de él de quien se hereda y no se sube más.
+    #[test]
+    fn dentro_del_montaje_la_referencia_es_la_biblioteca() {
+        fn arbol(p: &Path) -> Option<(u32, u32, u32, u64)> {
+            match p.to_str().unwrap() {
+                "/series" => Some((0o777, 1026, 100, DEV_BIBLIOTECA)),
+                "/" => Some((0o755, 0, 0, DEV_RAIZ_CONTENEDOR)),
+                _ => None,
+            }
+        }
+        let destino = Path::new("/series/Dalgliesh (2021)/Season 01/Dalgliesh 1x01.mkv");
+        assert_eq!(
+            referencia_para(destino, arbol),
+            Some((0o777, 1026, 100, DEV_BIBLIOTECA))
+        );
     }
 
     /// Una carpeta cerrada pero legible por su dueño sigue siendo referencia
