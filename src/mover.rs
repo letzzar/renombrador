@@ -128,6 +128,18 @@ mod permisos {
         }
     }
 
+    /// `modo uid:gid` en el formato del log, con `-` en lo que no se sepa.
+    pub fn describir(modo: Option<u32>, uid: Option<u32>, gid: Option<u32>) -> String {
+        let n = |v: Option<u32>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+        format!(
+            "{} {}:{}",
+            modo.map(|m| format!("{:o}", m))
+                .unwrap_or_else(|| "-".to_string()),
+            n(uid),
+            n(gid)
+        )
+    }
+
     /// Comprueba el resultado y describe la diferencia si no es el que se pidió.
     /// `None` cuando quedó como debía.
     ///
@@ -146,21 +158,11 @@ mod permisos {
         if !modo_mal && !duenio_mal {
             return None;
         }
-        let pedido = |v: Option<u32>, octal: bool| match (v, octal) {
-            (Some(v), true) => format!("{:o}", v),
-            (Some(v), false) => v.to_string(),
-            (None, _) => "-".to_string(),
-        };
         Some(format!(
-            "'{}' quedó en {:o} {}:{} y se le pidió {} {}:{} \
-             (¿ACL del recurso rechazando el cambio?)",
+            "'{}' quedó en {} y se le pidió {} (¿ACL del recurso rechazando el cambio?)",
             ruta.display(),
-            m,
-            u,
-            g,
-            pedido(modo, true),
-            pedido(uid, false),
-            pedido(gid, false),
+            describir(Some(m), Some(u), Some(g)),
+            describir(modo, uid, gid),
         ))
     }
 }
@@ -235,6 +237,24 @@ pub struct Herencia {
     #[cfg(unix)]
     gid_carpeta: Option<u32>,
 }
+
+/// Modo con el que se deposita un archivo cuando no hay de dónde sacarlo: ni el
+/// origen sirve (llegó sin un solo bit de lectura) ni la carpeta de destino da
+/// referencia.
+///
+/// Es el último recurso, y existe porque la alternativa —no tocar nada— deja en
+/// la biblioteca un archivo que no puede abrir nadie. Pasó de verdad: en el NAS,
+/// `/series` es un recurso con ACL y sus bits POSIX se leen a cero, así que no
+/// da referencia; con un origen ya en `000`, las dos fuentes fallaban a la vez y
+/// el `000` se propagaba sin que nada lo dijera, porque tampoco se pedía ningún
+/// modo que pudiera desmentirse después.
+///
+/// `644` y no algo más abierto porque esto es exactamente el caso en el que no
+/// sabemos nada de la biblioteca: deja el archivo legible para todos, que es lo
+/// que hacía falta, sin repartir escritura a ciegas. `FILE_MODE` está para
+/// cuando la biblioteca quiere otra cosa.
+#[cfg(unix)]
+const MODO_ULTIMO_RECURSO: u32 = 0o644;
 
 /// Modo de carpeta equivalente a un modo de archivo: el mismo, más permiso de
 /// paso (`x`) allí donde hay lectura. Copiarlo tal cual dejaría una carpeta que
@@ -376,7 +396,11 @@ impl Herencia {
             ) {
                 (Some(o), Some(c)) => Some(o | c),
                 (Some(o), None) => Some(o),
-                (None, c) => c,
+                (None, Some(c)) => Some(c),
+                // Ninguna de las dos fuentes sirve. No es "no sabemos qué
+                // poner", es "el archivo se queda ilegible si no ponemos nada":
+                // ver `MODO_ULTIMO_RECURSO`.
+                (None, None) => Some(MODO_ULTIMO_RECURSO),
             },
         };
         (
@@ -503,13 +527,32 @@ fn normalizar_archivo(ruta: &Path, h: Herencia, origen: Origen) {
 fn repasar_archivo(ruta: &Path, h: Herencia, origen: Origen) {
     let (modo, uid, gid) = h.para_archivo(origen);
     permisos::aplicar(ruta, modo, uid, gid);
-    // El aviso va por `stderr`, con el mismo formato que el log del servicio, y
-    // no por un `Result`: el archivo ya está movido y en su sitio, así que esto
-    // no es un fallo de la operación sino el sistema de archivos negándose a lo
+
+    // Una línea por archivo con las tres cosas que hacen falta para entender
+    // cualquier sorpresa de permisos: lo que traía, lo que se le pidió y lo que
+    // quedó. Diagnosticar un `000` sin esto costó varios ciclos de prueba
+    // enteros, porque cada uno exigía la foto del "antes" tomada a mano y a
+    // tiempo, y el "antes" desaparece en cuanto el archivo se mueve.
+    println!(
+        "[INFO]   -> permisos: origen {} · pedido {} · final {}",
+        permisos::describir(origen.modo, origen.uid, origen.gid),
+        permisos::describir(modo, uid, gid),
+        permisos::estado_de(ruta)
+            .map(|(m, u, g, _)| permisos::describir(Some(m), Some(u), Some(g)))
+            .unwrap_or_else(|| "?".to_string()),
+    );
+    // El aviso sale por la misma salida que el resto del log —`stdout`— y no
+    // por un `Result`: el archivo ya está movido y en su sitio, así que esto no
+    // es un fallo de la operación sino el sistema de archivos negándose a lo
     // que le pedimos. Callarlo es lo que costó un ciclo entero de pruebas para
     // ver un `000` en la biblioteca.
+    //
+    // Por `stdout` y no por `stderr` a propósito: `docker logs` manda cada
+    // stream al suyo, así que un aviso en `stderr` se pierde en cuanto alguien
+    // filtra el log con `| grep` sin acordarse del `2>&1`. Justo el aviso que
+    // más falta hace es el que no puede depender de eso.
     if let Some(aviso) = permisos::discrepancia(ruta, modo, uid, gid) {
-        eprintln!("[WARN] {}", aviso);
+        println!("[WARN] {}", aviso);
     }
 }
 
@@ -1086,8 +1129,8 @@ mod tests {
         // El escenario exacto del NAS: se pidió 777 y quedó en 000.
         let aviso = permisos::discrepancia(&f, Some(0o777), Some(uid_real), Some(gid_real))
             .expect("un 000 donde se pedía 777 tiene que saltar");
-        assert!(aviso.contains("quedó en 0"), "{aviso}");
-        assert!(aviso.contains("se le pidió 777"), "{aviso}");
+        assert!(aviso.contains("quedó en 0 "), "{aviso}");
+        assert!(aviso.contains("se le pidió 777 "), "{aviso}");
 
         // Y cuando sí cuadra, no se dice nada.
         fs::set_permissions(&f, fs::Permissions::from_mode(0o777)).unwrap();
@@ -1096,6 +1139,41 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&raiz);
+    }
+
+    /// El caso que dejaba el `000` en la biblioteca: el archivo llega ilegible
+    /// **y** la carpeta de destino no da referencia (`/series` es un recurso con
+    /// ACL y sus bits POSIX se leen a cero). Con las dos fuentes fuera, "no
+    /// tocar nada" significaba dejar en la biblioteca un archivo que no abre
+    /// nadie, y encima sin pedir ningún modo, así que ni el aviso saltaba.
+    #[test]
+    fn un_origen_ilegible_sin_referencia_no_se_queda_en_000() {
+        let sin_referencia = Herencia::default();
+        let (modo, uid, gid) = sin_referencia.para_archivo(archivo(0o000, 1026, 100));
+
+        assert_eq!(modo, Some(MODO_ULTIMO_RECURSO), "legible para todos");
+        assert_ne!(modo, Some(0o000));
+        assert_eq!((uid, gid), (Some(1026), Some(100)), "el dueño sí se preserva");
+    }
+
+    /// Pero el último recurso es eso, el último: en cuanto una de las dos
+    /// fuentes sirve, manda ella y no se inventa nada.
+    #[test]
+    fn el_ultimo_recurso_no_pisa_a_nadie() {
+        // Solo el archivo.
+        assert_eq!(
+            Herencia::default().para_archivo(archivo(0o600, 1026, 100)).0,
+            Some(0o600)
+        );
+        // Solo la carpeta.
+        let solo_carpeta = Herencia {
+            modo_carpeta: Some(0o775),
+            ..Herencia::default()
+        };
+        assert_eq!(
+            solo_carpeta.para_archivo(archivo(0o000, 1026, 100)).0,
+            Some(0o664)
+        );
     }
 
     /// Caso 3: lo que trae el archivo no cuadra y lo cubre la carpeta.

@@ -158,7 +158,16 @@ fn enmascarar(api_key: &str) -> String {
 
 fn banner(env: &Entorno) {
     let o = &env.opts;
-    log("INFO", "Renombrador TMDb (servicio) iniciado.");
+    // La versión, lo primero. Sin ella, "¿bajó la imagen nueva o sigue con la
+    // vieja?" no se puede contestar mirando el log, y esa duda ha costado ya
+    // varios ciclos de prueba enteros.
+    log(
+        "INFO",
+        format!(
+            "Renombrador TMDb (servicio) {} iniciado.",
+            env!("CARGO_PKG_VERSION")
+        ),
+    );
     log("INFO", format!("  API key:        {}", enmascarar(&o.api_key)));
     log("INFO", format!("  Idioma:         {}", o.idioma.codigo()));
     log("INFO", format!("  Descargas:      {}", env.watch_dir.display()));
