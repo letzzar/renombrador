@@ -167,37 +167,73 @@ mod permisos {
     }
 }
 
+/// Qué se ha podido averiguar del sitio al que va el archivo.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Referencia {
+    /// Un nivel del que aprender: modo, `uid` y `gid`.
+    Valida(u32, u32, u32),
+    /// La carpeta existe pero sus bits POSIX se leen a cero. No es una carpeta
+    /// cerrada: es un recurso que lleva los permisos por **ACL** —lo normal en
+    /// un NAS Synology, se ve por el `+` de `ls -l`— y los bits POSIX son solo
+    /// la sombra que proyecta.
+    ///
+    /// Aquí no hay modo que copiar y, sobre todo, **no hay que imponer
+    /// ninguno**: cada `chmod` reescribe esos bits y borra la ACL que el
+    /// recurso acababa de heredarle al archivo. Se conserva el `uid:gid` por si
+    /// hace falta de respaldo.
+    GestionadaPorAcl(u32, u32),
+    /// Nada de lo que aprender: ni existe, ni está en este montaje.
+    Ninguna,
+}
+
 /// Sube por los ancestros de `destino` buscando el nivel que sirve de
 /// referencia: el primero que existe, con algún bit de lectura y **dentro del
 /// mismo sistema de archivos** que el primer nivel existente.
+///
+/// Si por el camino solo aparecen niveles ilegibles, eso no es "no se sabe
+/// nada": es la firma de un recurso con ACL, y se devuelve como tal.
 ///
 /// `estado` se inyecta —igual que en los desempates de `organizer`— para poder
 /// probar el límite de montaje sin montar nada: en un test no hay forma de
 /// fabricar un padre en otro sistema de archivos sin ser root.
 #[cfg(unix)]
-fn referencia_para<F>(destino: &Path, mut estado: F) -> Option<(u32, u32, u32, u64)>
+fn referencia_para<F>(destino: &Path, mut estado: F) -> Referencia
 where
     F: FnMut(&Path) -> Option<(u32, u32, u32, u64)>,
 {
     let mut referencia = Some(destino);
     // Dispositivo del primer nivel que existe: el de la biblioteca.
     let mut dispositivo: Option<u64> = None;
+    // Dueño del primer nivel ilegible que veamos, por si al final resulta que
+    // todo el camino es un recurso con ACL.
+    let mut duenio_acl: Option<(u32, u32)> = None;
+
+    let sin_referencia = |acl: Option<(u32, u32)>| match acl {
+        Some((u, g)) => Referencia::GestionadaPorAcl(u, g),
+        None => Referencia::Ninguna,
+    };
+
     loop {
-        let r = referencia?;
+        let Some(r) = referencia else {
+            return sin_referencia(duenio_acl);
+        };
         if r.as_os_str().is_empty() {
-            return None;
+            return sin_referencia(duenio_acl);
         }
         match estado(r) {
             Some(e) => {
                 if *dispositivo.get_or_insert(e.3) != e.3 {
                     // Hemos salido del montaje: ahí fuera ya no hay nada que
                     // podamos llamar "los permisos de la biblioteca".
-                    return None;
+                    return sin_referencia(duenio_acl);
                 }
                 if e.0 & 0o444 != 0 {
-                    return Some(e);
+                    return Referencia::Valida(e.0, e.1, e.2);
                 }
-                // Existe pero no sirve de referencia: seguir subiendo.
+                // Existe pero no sirve de referencia: seguir subiendo,
+                // recordando que aquí manda una ACL.
+                duenio_acl.get_or_insert((e.1, e.2));
                 referencia = r.parent();
             }
             // No existe todavía: es un nivel que vamos a crear nosotros.
@@ -236,6 +272,10 @@ pub struct Herencia {
     uid_carpeta: Option<u32>,
     #[cfg(unix)]
     gid_carpeta: Option<u32>,
+    /// El destino lleva los permisos por ACL: no se impone ningún modo, ni al
+    /// archivo ni a las carpetas. Ver [`Referencia::GestionadaPorAcl`].
+    #[cfg(unix)]
+    la_acl_manda: bool,
 }
 
 /// Modo con el que se deposita un archivo cuando no hay de dónde sacarlo: ni el
@@ -312,6 +352,26 @@ impl Origen {
     }
 }
 
+/// Copia el contenido y **nada más**.
+///
+/// `fs::copy` hace dos cosas, y la segunda es invisible: además del contenido,
+/// le impone al destino el modo del origen. Es un `chmod` que no decidimos
+/// nosotros y que llega antes de que nadie haya mirado dónde aterriza el
+/// archivo; en un recurso con ACL se lleva por delante la que el destino acaba
+/// de heredar, y el archivo pierde el `+` antes de que empecemos.
+///
+/// Aquí el archivo nuevo se queda con lo que el sistema de archivos le dé —la
+/// ACL del recurso, o la umask— y quien decide si hay que cambiarlo, y a qué, es
+/// `normalizar_archivo`: una sola vez, y con toda la información delante.
+fn copiar_contenido(origen: &Path, destino: &Path) -> std::io::Result<()> {
+    let mut o = fs::File::open(origen)?;
+    let mut d = fs::File::create(destino)?;
+    // `io::copy` entre dos ficheros usa `copy_file_range` en Linux, igual que
+    // `fs::copy`: no se paga nada por hacerlo a mano.
+    std::io::copy(&mut o, &mut d)?;
+    Ok(())
+}
+
 /// Copia las fechas del origen al archivo depositado, como hace `cp -p`.
 ///
 /// `fs::copy` trae el contenido y el modo, pero deja la fecha de modificación
@@ -382,9 +442,10 @@ impl Herencia {
         let (modo_archivo_env, modo_dir_env) = permisos::modos_forzados();
         let (uid_env, gid_env) = permisos::ids_forzados();
 
-        let (modo, uid, gid) = match referencia_para(destino, permisos::estado_de) {
-            Some((m, u, g, _)) => (Some(m), Some(u), Some(g)),
-            None => (None, None, None),
+        let (modo, uid, gid, la_acl_manda) = match referencia_para(destino, permisos::estado_de) {
+            Referencia::Valida(m, u, g) => (Some(m), Some(u), Some(g), false),
+            Referencia::GestionadaPorAcl(u, g) => (None, Some(u), Some(g), true),
+            Referencia::Ninguna => (None, None, None, false),
         };
 
         Self {
@@ -395,6 +456,7 @@ impl Herencia {
             gid_forzado: gid_env,
             uid_carpeta: uid,
             gid_carpeta: gid,
+            la_acl_manda,
         }
     }
 
@@ -418,6 +480,10 @@ impl Herencia {
     fn para_archivo(&self, origen: Origen) -> (Option<u32>, Option<u32>, Option<u32>) {
         let modo = match self.modo_archivo_forzado {
             Some(forzado) => Some(forzado),
+            // El recurso lleva los permisos por ACL: no se impone modo alguno.
+            // Cualquiera que pusiéramos sería un `chmod`, y un `chmod` borra la
+            // ACL heredada y deja el archivo peor de lo que estaba.
+            None if self.la_acl_manda => None,
             // Del archivo se conservan los nueve bits tal cual, `x` incluida:
             // en un recurso del NAS lo normal es que llegue en `777`, y
             // recortarle la `x` obliga a un `chmod` que le costaría la ACL.
@@ -459,11 +525,16 @@ impl Herencia {
     ///
     /// Sin archivo que copiar —el arranque creando `/series` o `_revisar`— manda
     /// la carpeta anterior tal cual.
+    ///
+    /// Y si el recurso lleva los permisos por ACL, no se impone ninguno: la
+    /// carpeta recién creada ya hereda la del recurso, que es exactamente lo que
+    /// se quiere, y un `chmod` encima solo serviría para borrarla.
     #[cfg(unix)]
     fn para_dir(&self, origen: Origen) -> (Option<u32>, Option<u32>, Option<u32>) {
         let especiales = self.modo_carpeta.unwrap_or(0) & 0o7000;
         let modo = match self.modo_dir_forzado {
             Some(forzado) => Some(forzado),
+            None if self.la_acl_manda => None,
             None => match origen.modo {
                 Some(_) => self
                     .para_archivo(origen)
@@ -574,12 +645,17 @@ fn repasar_archivo(ruta: &Path, h: Herencia, origen: Origen) {
     // enteros, porque cada uno exigía la foto del "antes" tomada a mano y a
     // tiempo, y el "antes" desaparece en cuanto el archivo se mueve.
     println!(
-        "[INFO]   -> permisos: origen {} · pedido {} · final {}",
+        "[INFO]   -> permisos: origen {} · pedido {} · final {}{}",
         permisos::describir(origen.modo, origen.uid, origen.gid),
         permisos::describir(modo, uid, gid),
         permisos::estado_de(ruta)
             .map(|(m, u, g, _)| permisos::describir(Some(m), Some(u), Some(g)))
             .unwrap_or_else(|| "?".to_string()),
+        if h.la_acl_manda {
+            "  [recurso con ACL: el modo lo pone él]"
+        } else {
+            ""
+        },
     );
     // El aviso sale por la misma salida que el resto del log —`stdout`— y no
     // por un `Result`: el archivo ya está movido y en su sitio, así que esto no
@@ -722,7 +798,7 @@ pub fn mover_seguro(origen: &Path, destino: &Path) -> Result<(), String> {
     nombre_tmp.push(".part");
     let tmp = destino.with_file_name(nombre_tmp);
 
-    fs::copy(origen, &tmp).map_err(|e| {
+    copiar_contenido(origen, &tmp).map_err(|e| {
         // Si la copia falló a medias, intentamos no dejar basura.
         let _ = fs::remove_file(&tmp);
         format!("error al copiar a '{}': {}", tmp.display(), e)
@@ -1043,15 +1119,61 @@ mod tests {
     /// cero) y la subida seguía hasta `/`, la raíz del contenedor, de donde
     /// salieron `Dalgliesh (2021)` y sus seis capítulos en `root:root`. La
     /// biblioteca acaba en su montaje: fuera no se aprende nada.
+    ///
+    /// Y lo que se encuentra por el camino no es "nada": es un recurso que lleva
+    /// los permisos por ACL, con su dueño, y eso cambia qué hay que hacer.
     #[test]
     fn la_referencia_no_sale_del_montaje_de_la_biblioteca() {
         let destino = Path::new("/series/Dalgliesh (2021)/Season 01/Dalgliesh 1x01.mkv");
-        assert_eq!(referencia_para(destino, arbol_del_contenedor), None);
+        assert_eq!(
+            referencia_para(destino, arbol_del_contenedor),
+            Referencia::GestionadaPorAcl(1026, 100)
+        );
     }
 
-    /// Y sin referencia no se toca nada: es preferible dejar que la ACL del
-    /// recurso propague lo suyo a imponer el `root:root 755` de la raíz del
-    /// contenedor (que además borra la ACL al hacer el chmod).
+    /// En un recurso con ACL no se impone ningún modo, ni al archivo ni a las
+    /// carpetas: la ACL heredada ya hace el trabajo y cada `chmod` la borra.
+    /// El dueño sí se arregla, que es lo que la copia deja en `root`.
+    #[test]
+    fn en_un_recurso_con_acl_no_se_impone_ningun_modo() {
+        let destino = Path::new("/series/Dalgliesh (2021)/Season 01/Dalgliesh 1x01.mkv");
+        let Referencia::GestionadaPorAcl(u, g) = referencia_para(destino, arbol_del_contenedor)
+        else {
+            panic!("el árbol del contenedor es justo ese caso");
+        };
+        let acl = Herencia {
+            uid_carpeta: Some(u),
+            gid_carpeta: Some(g),
+            la_acl_manda: true,
+            ..Herencia::default()
+        };
+        let descargado = archivo(0o777, 1026, 100);
+
+        assert_eq!(
+            acl.para_archivo(descargado),
+            (None, Some(1026), Some(100)),
+            "sin modo que imponer; el dueño, el del archivo"
+        );
+        assert_eq!(
+            acl.para_dir(descargado),
+            (None, Some(1026), Some(100)),
+            "las carpetas nuevas heredan la ACL del recurso y no se tocan"
+        );
+
+        // Ni siquiera un origen ilegible dispara el último recurso: aquí un
+        // modo impuesto sería peor que no hacer nada.
+        assert_eq!(acl.para_archivo(archivo(0o000, 1026, 100)).0, None);
+
+        // `FILE_MODE`/`DIR_MODE` siguen ganando: quien lo pide a mano, manda.
+        let forzado = Herencia {
+            modo_archivo_forzado: Some(0o664),
+            modo_dir_forzado: Some(0o775),
+            ..acl
+        };
+        assert_eq!(forzado.para_archivo(descargado).0, Some(0o664));
+        assert_eq!(forzado.para_dir(descargado).0, Some(0o775));
+    }
+
     /// Sin biblioteca de la que aprender, el archivo se queda tal y como venía:
     /// no se le impone nada, que es lo contrario de lo que pasaba cuando la
     /// referencia se escapaba a la raíz del contenedor.
@@ -1082,6 +1204,7 @@ mod tests {
             gid_forzado: None,
             uid_carpeta: Some(1026),
             gid_carpeta: Some(100),
+            la_acl_manda: false,
         }
     }
 
@@ -1385,7 +1508,7 @@ mod tests {
         let destino = Path::new("/series/Dalgliesh (2021)/Season 01/Dalgliesh 1x01.mkv");
         assert_eq!(
             referencia_para(destino, arbol),
-            Some((0o777, 1026, 100, DEV_BIBLIOTECA))
+            Referencia::Valida(0o777, 1026, 100)
         );
     }
 
