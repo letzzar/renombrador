@@ -88,18 +88,34 @@ mod permisos {
     /// Aplica propietario y modo a `ruta`. Cada mitad es opcional: sin dato que
     /// aplicar no se toca nada, que es preferible a inventarse un valor.
     ///
+    /// **Lo que ya está bien no se toca.** No es una optimización: en un recurso
+    /// con ACL de Synology, un `chmod` reescribe los bits POSIX y se lleva por
+    /// delante la ACL heredada (el `+` de `ls -l`), que es donde vive el acceso
+    /// de verdad. Un archivo que ya llega con el modo que le toca no necesita
+    /// ninguna llamada, y ahorrársela es lo que le conserva la ACL. Con el
+    /// `chown` pasa lo mismo y además limpia los bits setuid/setgid.
+    ///
     /// Los fallos no son fatales: el archivo ya está en su sitio, y ni el
     /// `chown` (que exige ser root o tener CAP_CHOWN) ni el `chmod` pueden
     /// hacer nada en un montaje que no los soporte.
     pub fn aplicar(ruta: &Path, modo: Option<u32>, uid: Option<u32>, gid: Option<u32>) {
         use std::os::unix::fs::PermissionsExt;
+        let actual = estado_de(ruta);
+
         // El chown va antes que el chmod: cambiar de propietario limpia los
         // bits setuid/setgid, así que al revés desharía un modo tipo 2775.
-        if uid.is_some() || gid.is_some() {
+        let hay_que_cambiar_duenio = match actual {
+            Some((_, u, g, _)) => uid.is_some_and(|n| n != u) || gid.is_some_and(|n| n != g),
+            None => uid.is_some() || gid.is_some(),
+        };
+        if hay_que_cambiar_duenio {
             let _ = std::os::unix::fs::chown(ruta, uid, gid);
         }
+
         if let Some(modo) = modo {
-            let _ = fs::set_permissions(ruta, fs::Permissions::from_mode(modo));
+            if actual.map(|a| a.0) != Some(modo) {
+                let _ = fs::set_permissions(ruta, fs::Permissions::from_mode(modo));
+            }
         }
     }
 }
@@ -297,10 +313,20 @@ impl Herencia {
     fn para_archivo(&self, origen: Origen) -> (Option<u32>, Option<u32>, Option<u32>) {
         let modo = match self.modo_archivo_forzado {
             Some(forzado) => Some(forzado),
+            // Del archivo se conservan los nueve bits tal cual, `x` incluida:
+            // en un recurso del NAS lo normal es que llegue en `777`, y
+            // recortarle la `x` obliga a un `chmod` que le costaría la ACL.
+            // Lo que no se hereda nunca es setuid/setgid, que en un archivo
+            // significan algo muy distinto que en una carpeta.
+            //
+            // De la carpeta, en cambio, solo se toma lectura y escritura: su
+            // `x` es permiso de paso, no de ejecución, y no pinta nada en un
+            // `.mkv` que llegó sin ella.
+            //
             // Un modo sin ningún bit de lectura no es un permiso que preservar,
             // es un archivo ilegible: ahí solo cuenta la carpeta.
             None => match (
-                origen.modo.filter(|m| m & 0o444 != 0).map(|m| m & 0o666),
+                origen.modo.filter(|m| m & 0o444 != 0).map(|m| m & 0o777),
                 self.modo_carpeta.map(|m| m & 0o666),
             ) {
                 (Some(o), Some(c)) => Some(o | c),
@@ -906,6 +932,51 @@ mod tests {
             (Some(0o2775), Some(1030), Some(65534)),
             "la carpeta nueva, a su medida: 664 + paso, y el setgid de la biblioteca"
         );
+    }
+
+    /// El caso real del NAS: Download Station deja el archivo en `777
+    /// letzzar:users` con la ACL del recurso, y la biblioteca es igual. Ahí no
+    /// hay nada que cambiar, y **no cambiar nada es el objetivo**: cada chmod
+    /// de más se lleva la ACL heredada.
+    #[test]
+    fn un_archivo_que_ya_esta_bien_no_necesita_ningun_cambio() {
+        let recurso = Herencia {
+            modo_carpeta: Some(0o777),
+            uid_carpeta: Some(1026),
+            gid_carpeta: Some(100),
+            ..Herencia::default()
+        };
+        let descargado = archivo(0o777, 1026, 100);
+
+        assert_eq!(
+            recurso.para_archivo(descargado),
+            (Some(0o777), Some(1026), Some(100)),
+            "el 777 del origen se conserva entero, x incluida"
+        );
+        assert_eq!(
+            recurso.para_dir(descargado),
+            (Some(0o777), Some(1026), Some(100)),
+            "y las carpetas nuevas salen igual que las vecinas"
+        );
+
+        // Y sobre el disco, ni un chmod ni un chown: lo que ya está bien no se
+        // toca, que es lo único que le conserva la ACL al archivo.
+        let raiz = caja("ya-esta-bien");
+        let f = raiz.join("x.mkv");
+        fs::write(&f, b"video").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o777)).unwrap();
+        let antes = fs::metadata(&f).unwrap().ctime_nsec();
+
+        let (m, u, g) = (Some(0o777), None, None);
+        permisos::aplicar(&f, m, u, g);
+
+        assert_eq!(modo(&f), 0o777);
+        assert_eq!(
+            fs::metadata(&f).unwrap().ctime_nsec(),
+            antes,
+            "ni siquiera se ha tocado el inodo: no hubo chmod"
+        );
+        let _ = fs::remove_dir_all(&raiz);
     }
 
     /// Caso 3: lo que trae el archivo no cuadra y lo cubre la carpeta.
