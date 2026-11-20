@@ -27,8 +27,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Instalar targets Rust
-        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      # Rust fijado por el mismo motivo que en Linux (ver allí): con el estable
+      # de noviembre de 2026 deja de compilar `objc2`, que arrastra eframe.
+      - name: Rust 1.96 + targets
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal \
+            --target x86_64-apple-darwin --target aarch64-apple-darwin
+          rustup default 1.96.0
+          rustc --version
 
       - name: Cache de cargo
         uses: Swatinem/rust-cache@v2
@@ -112,6 +118,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Mismo Rust fijado que en macOS y Linux (ver allí).
+      - name: Rust 1.96
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+          rustc --version
+
       - name: Cache de cargo
         uses: Swatinem/rust-cache@v2
 
@@ -174,8 +187,8 @@ jobs:
             libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
             libgl1-mesa-dev
 
-      # Rust fijado: con el estable de noviembre de 2026 `ashpd` 0.8 (lo usa
-      # `rfd` solo en Linux) deja de compilar por el cambio de inferencia del
+      # Rust fijado (también en macOS y Windows): con el estable de noviembre
+      # de 2026 `ashpd` 0.8 (lo usa `rfd` solo en Linux) deja de compilar por el cambio de inferencia del
       # tipo `!` (rust-lang/rust#148922). Con 1.96 compila. Quitar el fijado
       # cuando se suba `rfd` a una versión cuyo `ashpd` lo tenga resuelto.
       - name: Rust 1.96
