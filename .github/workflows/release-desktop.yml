@@ -20,7 +20,9 @@ permissions:
 jobs:
   # ---------------------------------------------------------------- macOS ----
   build-macos:
-    runs-on: macos-14   # Apple Silicon; compila ambas arquitecturas por target
+    # Apple Silicon; compila ambas arquitecturas por target. GitHub retiró
+    # `macos-14` (noviembre 2026: "configuration not supported").
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -171,6 +173,16 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
             libgl1-mesa-dev
+
+      # Rust fijado: con el estable de noviembre de 2026 `ashpd` 0.8 (lo usa
+      # `rfd` solo en Linux) deja de compilar por el cambio de inferencia del
+      # tipo `!` (rust-lang/rust#148922). Con 1.96 compila. Quitar el fijado
+      # cuando se suba `rfd` a una versión cuyo `ashpd` lo tenga resuelto.
+      - name: Rust 1.96
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+          rustc --version
 
       - name: Cache de cargo
         uses: Swatinem/rust-cache@v2
