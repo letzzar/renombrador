@@ -51,7 +51,8 @@ jobs:
 
       - name: Empaquetar .app
         run: |
-          cargo install cargo-bundle --locked
+          # Fijado: la 0.12 rechaza `osx_minimum_system_version` de Cargo.toml.
+          cargo install cargo-bundle --version 0.11.0 --locked
           cargo bundle --release --features gui --bin renombrador-gui
           APP="target/release/bundle/osx/Renombrador.app"
           # Sustituir el binario del bundle por el universal.
