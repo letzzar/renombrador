@@ -324,6 +324,69 @@ fn motivo_empate(candidatos: &[Candidato]) -> String {
     format!("match ambiguo (score {:.2}) entre: {}", tope, lista.join(" · "))
 }
 
+/// Cuántas veces más popular tiene que ser una película que su duplicado para
+/// quedarse con el empate. Con el caso real (`La Odisea`, 2026) la ficha buena
+/// tenía 483 y la duplicada 12.5, unas 38 veces: el margen es holgado.
+const DOMINIO_DUPLICADO: f64 = 10.0;
+
+/// ¿Son dos fichas de TMDb la misma película dada de alta dos veces? Mismo
+/// título original y mismo año (conocido). Un remake no pasa: cambia el año.
+fn es_duplicado_pelicula(a: &Candidato, b: &Candidato) -> bool {
+    let norm = |s: &str| s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    a.anio != "0000"
+        && a.anio == b.anio
+        && !a.nombre_original.trim().is_empty()
+        && norm(&a.nombre_original) == norm(&b.nombre_original)
+}
+
+/// Rompe un empate entre películas que son **la misma película duplicada** en
+/// TMDb.
+///
+/// En series los planes B–F desempatan con el episodio; una película no trae
+/// ningún dato más en el nombre. Pero TMDb a veces tiene la misma película dos
+/// veces: `La Odisea` (2026) aparecía como dos fichas con el mismo título,
+/// el mismo original (`The Odyssey`) y el mismo año, empatadas a 1.00. Ahí no
+/// hay nada que decidir: es la misma película, y la ficha buena es la que usa
+/// todo el mundo, que se nota en la popularidad.
+///
+/// Por eso la popularidad solo decide aquí, y con dos condiciones: todos los
+/// empatados han de ser duplicados del ganador (mismo original y mismo año) y
+/// el ganador ha de ser al menos `DOMINIO_DUPLICADO` veces más popular que
+/// cada uno de ellos. Si cualquier empatado es otra película, o la ventaja es
+/// pequeña, sigue siendo un empate genuino y el archivo va a revisión.
+fn desempatar_duplicado_pelicula(candidatos: &[Candidato], umbral: f64) -> Option<Candidato> {
+    let empatados = empatados(candidatos);
+    if empatados.len() < 2 || candidatos[0].score < umbral {
+        return None;
+    }
+    let ganador = empatados
+        .iter()
+        .map(|&i| &candidatos[i])
+        .max_by(|a, b| a.popularidad.total_cmp(&b.popularidad))?;
+    if !ganador.fiable {
+        return None;
+    }
+    let domina = empatados
+        .iter()
+        .map(|&i| &candidatos[i])
+        .filter(|c| c.id != ganador.id)
+        .all(|c| {
+            es_duplicado_pelicula(ganador, c)
+                && ganador.popularidad >= DOMINIO_DUPLICADO * c.popularidad
+        });
+    domina.then(|| ganador.clone())
+}
+
+/// Película con la que renombrar sin supervisión, si la hay: la elección firme
+/// de siempre o, si empata solo con duplicados de sí misma, la ficha que
+/// domina en popularidad. La usan el servicio y la app de escritorio.
+pub fn elegir_pelicula(candidatos: &[Candidato], umbral: f64) -> Option<Candidato> {
+    if eleccion_firme(candidatos, umbral) {
+        return candidatos.first().cloned();
+    }
+    desempatar_duplicado_pelicula(candidatos, umbral)
+}
+
 /// Cobertura mínima de palabras para dar por buena una entrada de caché.
 /// Los datos reales dejan un margen amplio: las entradas podridas medidas
 /// quedaron en 0.33-0.40 y las correctas en 1.00.
@@ -706,14 +769,16 @@ pub fn procesar_archivo(
             return manejar_dudoso(opts, path, "sin resultados en TMDb");
         }
 
-        let mejor = &candidatos[0];
         // Un candidato de variante desesperada nunca auto-renombra por score.
-        // Un empate tampoco: ver `hay_empate`.
+        // Un empate tampoco (ver `hay_empate`), salvo que sea la misma película
+        // duplicada en TMDb (ver `desempatar_duplicado_pelicula`).
         let empate = hay_empate(&candidatos);
-        let confiado = mejor.score >= opts.umbral && mejor.fiable && !empate;
-        if confiado || opts.accion_dudoso == AccionDudoso::Forzar {
-            let score = mejor.score;
-            match construir_y_mover_pelicula(client, opts, mejor, path, &ext) {
+        let elegido = elegir_pelicula(&candidatos, opts.umbral);
+        let mejor = &candidatos[0];
+        if elegido.is_some() || opts.accion_dudoso == AccionDudoso::Forzar {
+            let elegido = elegido.unwrap_or_else(|| mejor.clone());
+            let score = elegido.score;
+            match construir_y_mover_pelicula(client, opts, &elegido, path, &ext) {
                 Ok(destino) => Resultado::Renombrado {
                     destino,
                     score,
@@ -721,7 +786,7 @@ pub fn procesar_archivo(
                 },
                 Err(Fallo::Red(e)) => Resultado::ErrorRed(e),
                 Err(Fallo::SerieNoExiste) => {
-                    Resultado::Error(format!("la película {} no existe en TMDb", mejor.id))
+                    Resultado::Error(format!("la película {} no existe en TMDb", elegido.id))
                 }
                 Err(Fallo::Definitivo(e)) => Resultado::Error(e),
             }
@@ -1379,5 +1444,89 @@ mod tests {
         let m = motivo_empate(&cs);
         assert!(m.contains("Dune (2021)"), "{m}");
         assert!(m.contains("Dune (1984)"), "{m}");
+    }
+
+    fn peli(id: i64, titulo: &str, original: &str, anio: &str, score: f64, pop: f64) -> Candidato {
+        Candidato {
+            media_type: "movie".to_string(),
+            nombre_original: original.to_string(),
+            ..cand_id(id, titulo, anio, score, pop)
+        }
+    }
+
+    /// Las dos fichas reales de `La Odisea` (2026) en TMDb, tal como salen
+    /// de la búsqueda: empatadas a 1.00 y con el mismo original.
+    fn las_dos_odisea() -> Vec<Candidato> {
+        vec![
+            peli(1368337, "La Odisea", "The Odyssey", "2026", 1.0, 483.05),
+            peli(1698863, "La odisea", "The Odyssey", "2026", 1.0, 12.51),
+            peli(999140, "La odisea de Dandelion", "Planètes", "2026", 0.932, 0.85),
+        ]
+    }
+
+    #[test]
+    fn una_pelicula_duplicada_en_tmdb_se_queda_con_la_ficha_buena() {
+        let cs = las_dos_odisea();
+        assert!(hay_empate(&cs));
+        assert!(!eleccion_firme(&cs, 0.85));
+        let g = elegir_pelicula(&cs, 0.85).expect("debe desempatar");
+        assert_eq!(g.id, 1368337);
+    }
+
+    #[test]
+    fn da_igual_el_orden_en_que_tmdb_devuelva_los_duplicados() {
+        let mut cs = las_dos_odisea();
+        cs.swap(0, 1);
+        assert_eq!(elegir_pelicula(&cs, 0.85).map(|c| c.id), Some(1368337));
+    }
+
+    #[test]
+    fn dos_peliculas_distintas_con_el_mismo_titulo_no_se_desempatan() {
+        // Remake: mismo título y original, distinto año. No es un duplicado.
+        let cs = vec![
+            peli(1, "Dune", "Dune", "2021", 1.0, 500.0),
+            peli(2, "Dune", "Dune", "1984", 1.0, 5.0),
+        ];
+        assert!(elegir_pelicula(&cs, 0.85).is_none());
+        // Mismo año pero distinto original: dos películas distintas.
+        let cs = vec![
+            peli(1, "La casa", "The House", "2022", 1.0, 500.0),
+            peli(2, "La casa", "La casa", "2022", 1.0, 5.0),
+        ];
+        assert!(elegir_pelicula(&cs, 0.85).is_none());
+    }
+
+    #[test]
+    fn sin_ventaja_clara_de_popularidad_sigue_siendo_empate() {
+        let cs = vec![
+            peli(1, "La Odisea", "The Odyssey", "2026", 1.0, 100.0),
+            peli(2, "La odisea", "The Odyssey", "2026", 1.0, 20.0),
+        ];
+        assert!(elegir_pelicula(&cs, 0.85).is_none());
+    }
+
+    #[test]
+    fn un_tercero_empatado_que_no_es_duplicado_impide_desempatar() {
+        let mut cs = las_dos_odisea();
+        cs.push(peli(5, "La odisea", "L'Odyssée", "2026", 1.0, 1.0));
+        assert!(elegir_pelicula(&cs, 0.85).is_none());
+    }
+
+    #[test]
+    fn sin_anio_no_se_puede_saber_si_es_duplicado() {
+        let cs = vec![
+            peli(1, "La Odisea", "The Odyssey", "0000", 1.0, 500.0),
+            peli(2, "La odisea", "The Odyssey", "0000", 1.0, 5.0),
+        ];
+        assert!(elegir_pelicula(&cs, 0.85).is_none());
+    }
+
+    #[test]
+    fn el_desempate_por_duplicado_respeta_el_umbral() {
+        let cs = vec![
+            peli(1, "La Odisea", "The Odyssey", "2026", 0.70, 500.0),
+            peli(2, "La odisea", "The Odyssey", "2026", 0.70, 5.0),
+        ];
+        assert!(elegir_pelicula(&cs, 0.85).is_none());
     }
 }

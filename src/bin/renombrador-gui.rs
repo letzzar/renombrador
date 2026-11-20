@@ -22,7 +22,9 @@ use std::{
 use renombrador::cache::SeriesCache;
 use renombrador::config::Idioma;
 use renombrador::mover::renombrar_si_seguro;
-use renombrador::organizer::{eleccion_firme, elegir_serie, titulo_de_capitulo, Busqueda};
+use renombrador::organizer::{
+    eleccion_firme, elegir_pelicula, elegir_serie, titulo_de_capitulo, Busqueda,
+};
 use renombrador::parse::{
     clave_cache_titulo, extraer_info_archivo, limpiar_nombre_archivo, EpisodioInfo,
 };
@@ -451,8 +453,10 @@ impl AppRenombrador {
                     }
 
                     let mejor = &candidatos[0];
-                    // La variante desesperada nunca auto-renombra por score.
-                    if mejor.score >= UMBRAL_AUTO && mejor.fiable {
+                    // Misma decisión que el servicio: ni la variante
+                    // desesperada ni un empate auto-renombran, salvo que el
+                    // empate sea la misma película duplicada en TMDb.
+                    if let Some(mejor) = elegir_pelicula(&candidatos, UMBRAL_AUTO) {
                         let titulo_limpio = limpiar_nombre_archivo(&mejor.titulo);
                         let nuevo_nombre =
                             format!("{} [{}].{}", titulo_limpio, mejor.anio, ext);
